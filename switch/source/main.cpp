@@ -61,7 +61,7 @@ int main(int argc, char *argv[]) {
     // Switch A edge: longer smoke (~5s at 60).
     if (pad.a && !a_prev && (status == RuntimeStatus::Ready || status == RuntimeStatus::Ran)) {
       std::vector<std::string> notice{
-          "Smoke boot: 300 frames (~5s). Cyan bar must keep growing.",
+          "Smoke boot: 300 frames (~5s).",
           "If it freezes early, check last_boot.txt next to the NRO.",
           host.application_mode ? "Mode OK (Application)." : "WARNING: Applet mode - likely too little RAM.",
       };
@@ -80,8 +80,8 @@ int main(int argc, char *argv[]) {
     // Switch X: long run. Soft FB present. Plus aborts (after a short grace). Home exits.
     if (pad.triangle && !triangle_prev && (status == RuntimeStatus::Ready || status == RuntimeStatus::Ran)) {
       std::vector<std::string> notice{
-          "Long run: donor GS + deko3d present. B=Cross(OK), A=Circle.",
-          "Hold Plus ~1.5s abort. coregs=1 in ini to test BackendDk.",
+          "Long run: CoreGS GPU renderer. B=Cross(OK), A=Circle.",
+          "Hold Plus ~1.5s to abort. Logs go next to the NRO.",
           host.application_mode ? "Mode: Application." : "WARNING: Applet mode - may OOM silently.",
       };
       gt4::switch_app::present_status_lines(notice);
@@ -103,9 +103,9 @@ int main(int argc, char *argv[]) {
     lines.push_back(runtime_message);
     lines.push_back("scale=" + std::to_string(settings.scale) +
                     "  performance=" + std::string(settings.performance_mode ? "on" : "off") +
-                    "  coregs=" + std::string(settings.coregs ? "on" : "off"));
+                    "  renderer=" + std::string(settings.coregs ? "CoreGS GPU" : "CPU GS (coregs.off)"));
     lines.push_back("A: smoke 300f (~5s) | X: long run | Plus: exit menu");
-    lines.push_back("Minus: Performance | L+R: scale | coregs.on enables BackendDk");
+    lines.push_back("Minus: Performance | L+R: scale");
     if (!host.application_mode)
       lines.push_back("TIP: hold R when launching a title to force full RAM, or use hbmenu title override.");
 

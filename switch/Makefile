@@ -110,19 +110,13 @@ export:
 	@if command -v cmd.exe >/dev/null 2>&1; then \
 	  cmd.exe /c "D:\gt4sr\switch\tools\export-switch.cmd"; \
 	else \
-	  mkdir -p ../export/switch/saves ../export/switch/shaders \
-	           ../export/switch-gpu/saves ../export/switch-gpu/shaders; \
-	  cp -f "$(BUILD)/$(TARGET).nro" ../export/switch/gt4recomp.nro; \
+	  mkdir -p ../export/switch-gpu/saves ../export/switch-gpu/shaders; \
 	  cp -f "$(BUILD)/$(TARGET).nro" ../export/switch-gpu/gt4recomp.nro; \
 	  if test -f ../private/switch-ee/core.elf; then \
-	    cp -f ../private/switch-ee/core.elf ../export/switch/core.elf; \
 	    cp -f ../private/switch-ee/core.elf ../export/switch-gpu/core.elf; \
 	  fi; \
-	  rm -f ../export/switch/coregs.on; \
-	  : > ../export/switch-gpu/coregs.on; \
-	  echo soft > ../export/switch/THIS_IS_SOFT.txt; \
-	  echo gpu > ../export/switch-gpu/THIS_IS_GPU.txt; \
-	  echo Exported ../export/switch and ../export/switch-gpu; \
+	  rm -f ../export/switch-gpu/coregs.on; \
+	  echo Exported ../export/switch-gpu; \
 	fi
 
 require: all

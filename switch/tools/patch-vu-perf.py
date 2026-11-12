@@ -20,6 +20,15 @@ extern "C" void gt4_vu1_aot_snapshot(std::uint64_t *compiled, std::uint64_t *int
 }
 '''
 
+# VU0 micro programs (VCALLMS from the EE) run in the donor's exact interpreter; time them as their own slot.
+VCALLMS_NEEDLE = "void vcallms(Cpu &, std::uint32_t address) { vu::run(0, address); }"
+VCALLMS_INJECT = (
+    "void vcallms(Cpu &, std::uint32_t address) {\n"
+    "    gt4::perf::Scope perf_vu0(gt4::perf::kVu0);\n"
+    "    vu::run(0, address);\n"
+    "}"
+)
+
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -51,6 +60,10 @@ def main() -> int:
         out = out.replace(bad, good, 1)
     if SNAPSHOT_MARKER not in out and "Counters g_counters;" in out:
         out = out.replace("Counters g_counters;", "Counters g_counters;" + SNAPSHOT_INJECT, 1)
+    if out.count(VCALLMS_NEEDLE) != 1:
+        print("vcallms anchor not found exactly once", file=sys.stderr)
+        return 1
+    out = out.replace(VCALLMS_NEEDLE, VCALLMS_INJECT, 1)
     pathlib.Path(sys.argv[2]).write_text(out, encoding="utf-8")
     print("patched", sys.argv[2])
     return 0

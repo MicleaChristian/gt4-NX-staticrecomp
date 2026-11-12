@@ -1,5 +1,21 @@
 # Current Status
 
+## Switch: GPU-only, playable-first plan (2026-11-12, later)
+
+Owner dropped the soft (CPU GS) export. One folder, `export/switch-gpu/`; CoreGS on deko3d is the default with no
+marker file (`coregs.off` next to the NRO is a debug fallback only). Plan rewritten in
+[SWITCH-PORT-PLAN](SWITCH-PORT-PLAN.md) around a playable gate (menus and car select ≥30 FPS, Time Trial ≥30 FPS
+with a correct picture, sound, saves, clean exit) with phases A (truthful logs + audio) through F (polish).
+
+- First device logs (run with CoreGS accidentally off, `coregs.on` missing): CPU GS 12–150 ms/frame, plus
+  15–30 ms/frame of untimed EE/IOP/VU0 work (High confidence). Saved in `private/switch-device-logs/`.
+- `perf.log` now splits time into EE, IOP, VU0, VU1 AOT/interpreter, GIF, GS GPU draw, GS CPU fallback, GS flush,
+  GS compose and present. A stale-object bug that booked GIF time as VU1 was fixed (shared-header dependencies in
+  `switch/runtime.mk`).
+- Audio: SPU2 output (48 kHz stereo) now plays through a six-buffer libnx audout ring that never blocks; drops
+  are counted in `stderr.log` (`[audio]`). Gaps are expected while the game runs below full speed.
+- NRO 65,173,701 bytes. Next: owner device run (title, menu, car select, race) to rank phase B vs D/E.
+
 ## Switch 60 FPS plan (2026-11-12)
 
 **TASK-174** Phases 0–5 implemented in tree (device gates pending owner retest). NRO ~65 MiB (VU1 AOT linked).

@@ -1,38 +1,30 @@
-# Export (Switch builds)
+# Export (Switch build)
 
-Two folders, same NRO binary — CoreGS is selected by `coregs.on` next to the NRO.
-
-| Folder | Path | What it is |
-|---|---|---|
-| **Soft** | `export/switch/` | Donor CPU GS + deko3d present (no `coregs.on`) |
-| **GPU** | `export/switch-gpu/` | CoreGS BackendDk + WritebackDk (`coregs.on` included) |
-
-Each successful NRO build refreshes **both** in place.
+One player folder: `export/switch-gpu/`. The NRO always uses the CoreGS GPU renderer (deko3d); nothing has to be
+enabled. Each successful NRO build refreshes it in place.
 
 ## Copy to the Switch
 
-Pick one folder and copy it to the SD card, for example:
+Copy the folder's contents to the SD card, for example:
 
 ```text
-sdmc:/switch/GT4/          ← soft, or
-sdmc:/switch/GT4-gpu/      ← GPU
+sdmc:/switch/GT4/
   gt4recomp.nro
   core.elf
-  coregs.on                ← only in the GPU folder
-  *.iso                    ← your disc (not shipped here)
+  *.iso                     your disc (not shipped here)
   saves/
 ```
 
-## Rebuild → refresh export
+Delete any old `coregs.on` there; it is no longer used. A `coregs.off` file switches back to the CPU renderer for
+debugging only (very slow).
+
+After a run, copy back `perf.log`, `session_summary.txt` and `stderr.log` (see `PERF.md`).
+
+## Rebuild and refresh the export
 
 ```bat
 set DEVKITPRO=D:\devkitPro
 cd /d D:\gt4sr\switch
 make require SWITCH_EE_GENERATED=../private/switch-ee/generated
-```
-
-Or:
-
-```bat
 switch\tools\export-switch.cmd
 ```

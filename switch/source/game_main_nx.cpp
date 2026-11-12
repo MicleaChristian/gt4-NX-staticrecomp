@@ -1,4 +1,4 @@
-// TASK-174: strong Switch entry — donor boot + optional CoreGS BackendDk (deko3d present).
+// TASK-174: strong Switch entry — donor boot + CoreGS BackendDk (deko3d present).
 #include "runtime_link.hpp"
 
 #include "coregs_nx.hpp"
@@ -207,7 +207,7 @@ extern "C" int gt4_switch_runtime_probe(const char *iso_path_utf8, const char *a
     return 3;
   }
   set_msg(message, message_cap,
-          "Runtime linked. Donor GS + deko3d present (coregs=1 to test BackendDk). Plus aborts.");
+          "Runtime linked. CoreGS (deko3d GPU). Hold Plus to abort.");
   return 0;
 }
 
@@ -255,14 +255,16 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
     return 5;
   }
   const auto settings = gt4::switch_app::load_settings(std::filesystem::path(app));
-  if (settings.coregs) {
-    if (!gt4::switch_app::coregs_start()) {
-      std::fprintf(stderr, "[gt4-switch] CoreGS start failed; using donor CPU GS\n");
-    }
-  } else {
-    std::fprintf(stderr, "[gt4-switch] CoreGS off (set coregs=1 or coregs.on to enable BackendDk)\n");
+  if (!settings.coregs) {
+    std::fprintf(stderr, "[gt4-switch] WARNING: coregs.off found; donor CPU GS (debug only, very slow)\n");
+  } else if (!gt4::switch_app::coregs_start()) {
+    std::fprintf(stderr, "[gt4-switch] ERROR: CoreGS start failed; falling back to donor CPU GS (very slow)\n");
+    write_halt_log("CoreGS start failed; see stderr.log");
   }
   ps2::g_options.on_vblank = switch_host_vblank;
+  ps2::set_audio_sink([](const std::int16_t *samples, std::size_t frames) {
+    gt4::switch_app::audio_push(samples, frames);
+  });
 #endif
 
   std::uint32_t entry = 0;
@@ -270,6 +272,7 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
     std::fprintf(stderr, "[gt4-switch] load_elf failed for %s\n", elf.c_str());
 #if defined(__SWITCH__)
     ps2::g_options.on_vblank = nullptr;
+    ps2::set_audio_sink(nullptr);
     gt4::switch_app::coregs_stop();
     gt4::platform::nx::soft_present_end();
     write_halt_log("load_elf failed");
@@ -282,6 +285,8 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
   const int rc = ps2::run();
 #if defined(__SWITCH__)
   ps2::g_options.on_vblank = nullptr;
+  ps2::set_audio_sink(nullptr);
+  gt4::switch_app::audio_report(stderr);
   char why[128];
   std::snprintf(why, sizeof why, "run returned rc=%d frames=%llu halted=%d coregs=%d", rc,
                 static_cast<unsigned long long>(ps2::frame_count()), ps2::halted() ? 1 : 0,

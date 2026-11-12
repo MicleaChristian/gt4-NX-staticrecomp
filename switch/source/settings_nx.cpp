@@ -23,11 +23,9 @@ AppSettings load_settings(const std::filesystem::path &app_dir) {
     if (line.rfind("scale=", 0) == 0) s.scale = std::max(1, std::atoi(line.c_str() + 6));
     if (line.rfind("performance_mode=", 0) == 0) s.performance_mode = line.find('1') != std::string::npos;
     if (line.rfind("audio_enabled=", 0) == 0) s.audio_enabled = line.find('0') == std::string::npos;
-    if (line.rfind("coregs=", 0) == 0) s.coregs = line.find('1') != std::string::npos;
   }
   if (s.scale > 2) s.scale = 2; // Switch v1: keep host memory small
-  // Opt-in marker file next to the NRO (easy on SD without editing ini).
-  if (std::filesystem::exists(app_dir / "coregs.on")) s.coregs = true;
+  if (std::filesystem::exists(app_dir / "coregs.off")) s.coregs = false;
   return s;
 }
 
@@ -39,7 +37,6 @@ void save_settings(const std::filesystem::path &app_dir, const AppSettings &sett
   out << "scale=" << settings.scale << '\n';
   out << "performance_mode=" << (settings.performance_mode ? 1 : 0) << '\n';
   out << "audio_enabled=" << (settings.audio_enabled ? 1 : 0) << '\n';
-  out << "coregs=" << (settings.coregs ? 1 : 0) << '\n';
 }
 
 void settings_cycle_scale(AppSettings &settings) {

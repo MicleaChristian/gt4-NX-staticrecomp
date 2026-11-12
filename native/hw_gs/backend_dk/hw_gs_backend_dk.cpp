@@ -4,8 +4,10 @@
 // Present goes through deko3d staging copyBufferToImage. WritebackDk holds the GPU drawer scaffold.
 #include "hw_gs_backend.hpp"
 
+#include "cpuref_draw.hpp"
 #include "cpuref_renderer.hpp"
 #include "dk_gpu.hpp"
+#include "perf_nx.hpp"
 #include "platform/nx/deko3d_present.hpp"
 #include "writeback_dk.hpp"
 
@@ -85,12 +87,20 @@ bool Backend::init(const Options &options, std::string &error) {
         [wb](const hwgs::Batch &batch, hwgs::memory::LocalMemory &local, const hwgs::clut::ClutUnit &clut,
              hwgs::cpuref::DrawStats &draw_stats) -> bool {
           std::string err;
-          if (!wb->draw_batch(batch, local, clut, err)) {
-            wb->note_cpu_fallback();
-            return false; // CPU DrawBatch
+          bool drawn = false;
+          {
+            gt4::perf::Scope gpu_draw(gt4::perf::kGsGpuDraw);
+            drawn = wb->draw_batch(batch, local, clut, err);
           }
-          draw_stats.batches++;
-          draw_stats.primitives += batch.prims.size();
+          if (drawn) {
+            draw_stats.batches++;
+            draw_stats.primitives += batch.prims.size();
+            return true;
+          }
+          // Drawn here rather than by CpuRenderer so the fallback has its own perf slot.
+          wb->note_cpu_fallback();
+          gt4::perf::Scope cpu_draw(gt4::perf::kGsCpuDraw);
+          hwgs::cpuref::DrawBatch(batch, local, clut, draw_stats);
           return true;
         });
   }
@@ -191,6 +201,7 @@ const std::uint8_t *Backend::map_vram(std::uint32_t offset, std::uint32_t size) 
 void Backend::flush() {
   impl_->stats.flushes++;
   if (impl_->writeback.ready() && impl_->cpu) {
+    gt4::perf::Scope flush(gt4::perf::kGsFlush);
     std::string err;
     impl_->writeback.flush_to_slm(impl_->cpu->Memory().Local(), err);
   }
@@ -214,9 +225,11 @@ bool Backend::scanout(ScanoutRequest &request) {
   request.pixels.clear();
   if (!impl_->cpu) return false;
   if (impl_->writeback.ready()) {
+    gt4::perf::Scope flush(gt4::perf::kGsFlush);
     std::string err;
     impl_->writeback.flush_to_slm(impl_->cpu->Memory().Local(), err);
   }
+  gt4::perf::Scope compose(gt4::perf::kGsCompose);
   hwgs::cpuref::FrameImage frame = impl_->cpu->EndFrame();
   impl_->last_frame = frame;
   if (!frame.valid || frame.image.width == 0 || frame.image.height == 0) return false;

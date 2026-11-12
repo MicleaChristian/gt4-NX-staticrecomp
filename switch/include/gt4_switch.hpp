@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -11,9 +13,9 @@ struct AppSettings {
   int scale = 1; // CoreGS internal scale; Switch v1 default 1x
   bool performance_mode = true;
   bool audio_enabled = true;
-  // Off by default: CoreGS cpuref on device still corrupts some scenes (SCEA splash).
-  // Set coregs=1 in gt4recomp.ini (or create coregs.on) to test BackendDk.
-  bool coregs = false;
+  // CoreGS BackendDk is the only supported renderer. A `coregs.off` file next to the NRO
+  // falls back to the donor CPU GS for debugging; gt4recomp.ini no longer controls it.
+  bool coregs = true;
 };
 
 std::vector<std::filesystem::path> find_isos_in(const std::filesystem::path &directory);
@@ -46,6 +48,9 @@ InputState pad_poll();
 void audio_init(AppSettings &settings);
 void audio_shutdown();
 void audio_submit_silence();
+// Game audio: 48 kHz stereo Int16 frames from the SPU2 mixer. Never blocks; drops when the queue is full.
+void audio_push(const std::int16_t *stereo, std::size_t frames);
+void audio_report(std::FILE *out);
 
 void present_init(AppSettings &settings);
 void present_shutdown();

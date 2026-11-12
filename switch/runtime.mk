@@ -40,6 +40,14 @@ COREGS_OBJS := \
   $(BUILD)/hw_gs_pixel.o $(BUILD)/hw_gs_display.o \
   $(BUILD)/coregs_nx.o $(BUILD)/race_display.o $(BUILD)/perf_nx.o
 
+# Switch headers included by patched donor sources, CoreGS and the app. Objects that miss one of these
+# keep stale slot numbers or struct layouts, so every runtime/CoreGS/app object depends on all of them.
+SWITCH_SHARED_HEADERS := include/perf_nx.hpp include/coregs_nx.hpp include/gt4_switch.hpp \
+  $(HW_GS)/hw_gs_backend.hpp $(HW_GS)/backend_dk/writeback_dk.hpp $(HW_GS)/backend_dk/dk_gpu.hpp \
+  $(HW_GS)/cpuref/cpuref_renderer.hpp $(NATIVE)/platform/nx/deko3d_present.hpp
+$(RUNTIME_OBJS) $(COREGS_OBJS) $(addprefix $(BUILD)/,$(CPPFILES:.cpp=.o)) $(addprefix $(BUILD)/,$(NXCPP:.cpp=.o)): \
+  $(SWITCH_SHARED_HEADERS)
+
 VU1_PARTS := $(shell ls "$(VU1_GEN)"/vu1_generated_*.cpp 2>/dev/null)
 VU1_OBJS  := $(BUILD)/vu1_generated_table.o $(addprefix $(BUILD)/vu1_,$(addsuffix .o,$(basename $(notdir $(VU1_PARTS)))))
 

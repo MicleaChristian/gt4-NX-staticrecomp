@@ -1,19 +1,29 @@
 // TASK-174: device perf meter for the Switch NRO.
-// Writes perf.log (CSV, one line / ~60 guest frames) and session_summary.txt on exit.
+// Writes perf.log (one line / 60 guest frames) and session_summary.txt on exit.
+// Every object that includes this header must list it as a make prerequisite (runtime.mk):
+// a stale object keeps the old slot numbers and books its time into the wrong column.
 #pragma once
 
 #include <cstdint>
 
 namespace gt4::perf {
 
+// Exclusive time slots: a nested scope pauses its parent, so the columns add up to the frame.
 enum Slot : int {
-  kVu1Aot = 0,      // VU1 AOT compiled path
-  kVu1Interp = 1,   // VU1 interpreter fallback
-  kGif = 2,         // gif::transfer (CoreGS or donor)
-  kCoreGsFrame = 3, // CoreGS flush + compose + present at vblank
-  kSoftFrame = 4,   // donor display_frame readback
-  kPresent = 5,     // host present (GPU blit / libnx)
-  kSlotCount = 6,
+  kEe = 0,          // translated EE code (dispatch), including IPU/DMA work it triggers directly
+  kIop = 1,         // IOP interpreter (sync_iop)
+  kVu0 = 2,         // VU0 micro programs (VCALLMS, interpreted)
+  kVu1Aot = 3,      // VU1 AOT compiled programs
+  kVu1Interp = 4,   // VU1 interpreter fallback
+  kGif = 5,         // GIF packets: CoreGS front end (parse, batching) or donor CPU GS raster
+  kGsGpuDraw = 6,   // CoreGS: WritebackDk batch recording on deko3d
+  kGsCpuDraw = 7,   // CoreGS: CPU DrawBatch fallback (batch the GPU path refused)
+  kGsFlush = 8,     // CoreGS: GPU colour target read back into GS memory (includes GPU wait)
+  kGsCompose = 9,   // CoreGS: CPU display compose (EndFrame) + RGBA pack
+  kCoreGsFrame = 10,// CoreGS vblank glue not covered by the slots above
+  kSoftFrame = 11,  // donor display_frame readback (coregs.off only)
+  kPresent = 12,    // host present (GPU blit / libnx)
+  kSlotCount = 13,
 };
 
 // PC overlay vocabulary (scripts/vu1_aot_overlay.inc).
@@ -34,7 +44,8 @@ struct Scope {
   explicit Scope(int slot) { scope_begin(slot); }
   explicit Scope(Category category) {
     if (category == Category::vu1_aot) scope_begin(kVu1Aot);
-    else scope_begin(kVu1Interp); // VU0 rare; fold into interpret bucket
+    else if (category == Category::vu1_interpreter) scope_begin(kVu1Interp);
+    else scope_begin(kVu0);
   }
   ~Scope() { scope_end(); }
   Scope(const Scope &) = delete;
