@@ -112,10 +112,10 @@ bool Backend::init(const Options &options, std::string &error) {
           wb->note_cpu_fallback();
           return true;
         });
-    s.cpu->SetMemorySyncHook([wb](hwgs::memory::LocalMemory &local) {
+    s.cpu->SetMemorySyncHook([wb](hwgs::memory::LocalMemory &local, bool display_only) {
       gt4::perf::Scope flush(gt4::perf::kGsFlush);
       std::string err;
-      wb->flush_to_slm(local, err);
+      wb->flush_to_slm(local, err, display_only);
     });
     s.cpu->Memory().SetAccessHook([wb, cpu](std::uint32_t block, std::uint32_t blocks, bool write) {
       gt4::perf::Scope flush(gt4::perf::kGsFlush);
@@ -274,6 +274,8 @@ void Backend::present(PresentPhase phase) {
 bool Backend::end_frame(PresentPhase phase) {
   Impl &s = *impl_;
   s.stats.presents++;
+  // Cumulative; repeated so a session ended with Plus still leaves the numbers in stderr.log.
+  if (s.writeback.ready() && s.stats.presents % 600 == 0) s.writeback.report(stderr);
   if (s.cpu) s.cpu->SetDisplayField(phase == PresentPhase::field_odd);
   s.last_scanout.phase = phase;
   if (!scanout(s.last_scanout) || s.last_scanout.pixels.empty()) {

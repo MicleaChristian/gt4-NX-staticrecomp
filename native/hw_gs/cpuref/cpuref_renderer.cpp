@@ -131,7 +131,7 @@ std::vector<uint8_t> CpuRenderer::ReadFifo(uint32_t qwords) {
     }
     // First FIFO access must observe all earlier draws and uploads (10.2).
     frontEnd_.FlushBatch(FlushReason::Transfer);
-    if (memory_sync_hook_) memory_sync_hook_(memory_.Local());
+    if (memory_sync_hook_) memory_sync_hook_(memory_.Local(), false);
     bool overrun = false;
     std::vector<uint8_t> data = memory_.ReadLocalToHost(static_cast<size_t>(qwords) * 16u, overrun);
     if (overrun) ++fifoFaults;
@@ -161,7 +161,7 @@ void CpuRenderer::ResetGs(bool clearVram) {
 FrameImage CpuRenderer::EndFrame() {
     frontEnd_.VBlank(&kEverything, 1);
     frontEnd_.FlushBatch(FlushReason::VBlank);
-    if (memory_sync_hook_) memory_sync_hook_(memory_.Local());
+    if (memory_sync_hook_) memory_sync_hook_(memory_.Local(), true);
 
     FrameImage out;
     const display::DisplayLayout layout = display::compute_layout(displayRegs_, previousDby_);

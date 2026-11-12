@@ -113,8 +113,9 @@ public:
     using BatchOverride = std::function<bool(const Batch &, memory::LocalMemory &, const clut::ClutUnit &, DrawStats &)>;
     void SetBatchOverride(BatchOverride override) { batch_override_ = std::move(override); }
     // Optional: called after the final batch flush and before local memory is read for the display
-    // (EndFrame) or the FIFO (ReadFifo), so an override drawer can write its pixels back first.
-    using MemorySyncHook = std::function<void(memory::LocalMemory &)>;
+    // (EndFrame, display_only = true) or the FIFO (ReadFifo, display_only = false), so an override
+    // drawer can write its pixels back first.
+    using MemorySyncHook = std::function<void(memory::LocalMemory &, bool display_only)>;
     void SetMemorySyncHook(MemorySyncHook hook) { memory_sync_hook_ = std::move(hook); }
 
     const DrawStats& Stats() const { return stats_; }
