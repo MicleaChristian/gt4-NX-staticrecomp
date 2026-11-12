@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -39,13 +40,22 @@ public:
     bool ReadDrained() const { return !pending_ && readCursor_ == readData_.size(); }
     bool LocalToHostPending() const { return pending_.has_value(); }
 
+    // Optional: called before a transfer reads or writes local memory, with a conservative
+    // block range (start block, block count; wraps at 16384). A drawer that keeps pixels
+    // outside local memory (the Switch GPU writeback) uses it to write them back first.
+    using AccessHook = std::function<void(uint32_t block, uint32_t blocks, bool write)>;
+    void SetAccessHook(AccessHook hook) { accessHook_ = std::move(hook); }
+
     // Counters for the replay summary.
     uint64_t uploadCount = 0;
     uint64_t moveCount = 0;
     uint64_t readCount = 0;
 
 private:
+    void NotifyAccess(uint32_t block, uint32_t widthUnits, uint32_t rows, bool write);
+
     memory::LocalMemory local_;
+    AccessHook accessHook_;
     std::optional<LocalToHostSetup> pending_;
     std::vector<uint8_t> readData_;
     size_t readCursor_ = 0;

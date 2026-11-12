@@ -18,6 +18,10 @@ bool coregs_gif_transfer(int path, const std::uint8_t *data, std::uint32_t qwc);
 // Privileged GS register write (0x12000000..). Returns true if handled.
 bool coregs_write_privileged(std::uint32_t address, std::uint64_t value);
 
+// SetGsCrt syscall: posts the SMODE1/SYNCV/SMODE2 words the real BIOS would write.
+// Remembered so a CoreGS start after the syscall still gets the mode.
+void coregs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field);
+
 // One guest VBlank: compose + present through deko3d.
 // Returns true when a CoreGS frame was shown (caller skips donor display_frame blit).
 bool coregs_vblank_present(std::uint64_t frame_osd);

@@ -15,6 +15,82 @@ namespace {
 std::unique_ptr<gt4::hw::Dispatch> g_dispatch;
 bool g_active = false;
 
+struct CrtMode {
+  bool known = false;
+  std::uint32_t interlace = 0, mode = 0, field = 0;
+};
+CrtMode g_crt;
+
+// Must stay equal to gt4::gs_stream::map_set_gs_crt / map_set_gs_crt_syncv (PC, fixture-tested);
+// that translation unit is Win32-only, so the Switch build carries the same table.
+// SMODE1: LC bits 3-9, CMOD bits 13-14 (0 progressive, 2 NTSC, 3 PAL). SMODE2: INT bit 0, FFMD bit 1.
+bool map_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field, std::uint64_t &smode1,
+             std::uint64_t &smode2) {
+  constexpr std::uint64_t kCmodProgressive = 0, kCmodNtsc = 2, kCmodPal = 3;
+  constexpr std::uint64_t kLcAnalog = 32, kLcHdtv = 22, kLcVga = 15;
+  if (field > 1 || interlace > 1) return false;
+  std::uint64_t cmod = 0, lc = 0;
+  if (mode >= 0x1A && mode <= 0x3B) {
+    if (interlace) return false;
+    cmod = kCmodProgressive;
+    lc = kLcVga;
+  } else if (mode == 0x02 || mode == 0x03) {
+    cmod = mode == 0x02 ? kCmodNtsc : kCmodPal;
+    lc = kLcAnalog;
+  } else if (mode == 0x50) {
+    if (interlace) return false;
+    cmod = kCmodProgressive;
+    lc = kLcAnalog;
+  } else if (mode == 0x51) {
+    if (!interlace) return false;
+    cmod = kCmodProgressive;
+    lc = kLcHdtv;
+  } else if (mode == 0x52) {
+    if (interlace) return false;
+    cmod = kCmodProgressive;
+    lc = kLcHdtv;
+  } else {
+    return false;
+  }
+  smode1 = (cmod << 13) | (lc << 3);
+  smode2 = interlace ? (1u | (field ? 2u : 0u)) : 0u;
+  return true;
+}
+
+bool map_crt_syncv(std::uint32_t mode, std::uint64_t &syncv) {
+  // SYNCV: VFP bits 0-9, VFPE 10-19, VBP 20-31, VBPE 32-41, VDP 42-52, VS 53-63.
+  const auto pack = [](std::uint64_t vs, std::uint64_t vdp, std::uint64_t vbpe, std::uint64_t vbp, std::uint64_t vfpe,
+                       std::uint64_t vfp) {
+    return (vs << 53) | (vdp << 42) | (vbpe << 32) | (vbp << 20) | (vfpe << 10) | vfp;
+  };
+  if (mode == 0x02) {
+    syncv = pack(6, 480, 6, 26, 6, 1);
+    return true;
+  }
+  if (mode == 0x03) {
+    syncv = pack(5, 576, 5, 33, 5, 1);
+    return true;
+  }
+  return false;
+}
+
+void post_crt() {
+  if (!g_crt.known || !g_active || !g_dispatch || !g_dispatch->backend()) return;
+  std::uint64_t smode1 = 0, smode2 = 0;
+  if (!map_crt(g_crt.interlace, g_crt.mode, g_crt.field, smode1, smode2)) {
+    std::fprintf(stderr, "[gt4-switch] SetGsCrt interlace %u mode 0x%X field %u not mapped; CoreGS display unset\n",
+                 g_crt.interlace, g_crt.mode, g_crt.field);
+    return;
+  }
+  auto *backend = g_dispatch->backend();
+  backend->write_privileged(0x12000010u, smode1);
+  std::uint64_t syncv = 0;
+  if (map_crt_syncv(g_crt.mode, syncv)) backend->write_privileged(0x12000060u, syncv);
+  backend->write_privileged(0x12000020u, smode2);
+  std::fprintf(stderr, "[gt4-switch] CoreGS SMODE1=0x%llX SMODE2=0x%llX\n", static_cast<unsigned long long>(smode1),
+               static_cast<unsigned long long>(smode2));
+}
+
 // Fixed Switch environment for CoreGS (no getenv on NX for these).
 const char *lookup_env(const char *name) {
   static const std::unordered_map<std::string, const char *> kEnv = {
@@ -55,7 +131,13 @@ bool coregs_start() {
   }
   g_active = true;
   std::fprintf(stderr, "[gt4-switch] CoreGS BackendDk active\n");
+  post_crt();
   return true;
+}
+
+void coregs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field) {
+  g_crt = {true, interlace, mode, field};
+  post_crt();
 }
 
 void coregs_stop() {

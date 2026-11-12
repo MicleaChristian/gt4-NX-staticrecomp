@@ -79,8 +79,10 @@ $(BUILD)/rt_system.o: $(BUILD)/system_nx.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -I"$(RUNTIME_SRC)" -c "$<" -o "$@"
 $(BUILD)/rt_kernel.o: $(RUNTIME_SRC)/kernel.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
-$(BUILD)/rt_hw.o: $(RUNTIME_SRC)/hw.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
+$(BUILD)/hw_nx.cpp: $(RUNTIME_SRC)/hw.cpp $(TOOLS_DIR)/patch-hw-crt.py | $(BUILD)
+	@python "$(TOOLS_DIR)/patch-hw-crt.py" "$<" "$@"
+$(BUILD)/rt_hw.o: $(BUILD)/hw_nx.cpp | $(BUILD)
+	$(CXX) $(CXXFLAGS_RT) -I"$(RUNTIME_SRC)" -c "$<" -o "$@"
 $(BUILD)/rt_cop.o: $(RUNTIME_SRC)/cop.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
 $(BUILD)/rt_disc.o: $(RUNTIME_SRC)/disc.cpp | $(BUILD)

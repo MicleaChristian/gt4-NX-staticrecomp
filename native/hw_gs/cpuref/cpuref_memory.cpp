@@ -5,6 +5,8 @@
 
 #include <algorithm>
 
+#include "hw_batch.hpp"
+
 namespace hwgs::cpuref {
 
 namespace {
@@ -18,11 +20,17 @@ memory::TransferDirection DirectionOf(uint32_t dir) {
 
 LocalMemorySink::LocalMemorySink() = default;
 
-void LocalMemorySink::InvalidateDestination(const UploadCommit&) {
+void LocalMemorySink::NotifyAccess(uint32_t block, uint32_t widthUnits, uint32_t rows, bool write) {
+    if (accessHook_) accessHook_(block, FootprintBlocks(widthUnits, rows), write);
+}
+
+void LocalMemorySink::InvalidateDestination(const UploadCommit& commit) {
     // The CPU reference has no caches to drop: the SLM is always the truth.
+    NotifyAccess(commit.dbp, commit.dbw, commit.dsay + commit.rrh, true);
 }
 
 void LocalMemorySink::CommitUpload(const UploadCommit& commit, const uint8_t* bytes, size_t byteCount) {
+    NotifyAccess(commit.dbp, commit.dbw, commit.dsay + commit.rrh, true);
     const auto psm = memory::decodePsm(commit.dpsm);
     if (!psm) {
         return;  // invalid PSM: the transfer is dropped (counted by the front end's rules)
@@ -39,6 +47,8 @@ void LocalMemorySink::LocalToLocalMove(const LocalMoveCommit& move) {
     if (!sourcePsm || !destinationPsm) {
         return;
     }
+    NotifyAccess(move.sbp, move.sbw, move.ssay + move.rrh, false);
+    NotifyAccess(move.dbp, move.dbw, move.dsay + move.rrh, true);
     memory::localToLocal(local_,
                          memory::BufferView{move.sbp, move.sbw, *sourcePsm}, move.ssax, move.ssay,
                          memory::BufferView{move.dbp, move.dbw, *destinationPsm}, move.dsax, move.dsay,
@@ -83,6 +93,7 @@ std::vector<uint8_t> LocalMemorySink::TakeLocalToHostData() {
     if (!psm) {
         return data;
     }
+    NotifyAccess(setup.sbp, setup.sbw, setup.ssay + setup.rrh, false);
     const memory::BufferView source{setup.sbp, setup.sbw, *psm};
     const memory::TransferRect rect{setup.ssax, setup.ssay, setup.rrw, setup.rrh};
     memory::localToHost(local_, source, rect, data);  // 4-bit sources are refused (data stays empty)

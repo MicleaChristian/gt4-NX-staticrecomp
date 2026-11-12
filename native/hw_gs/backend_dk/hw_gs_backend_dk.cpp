@@ -49,6 +49,7 @@ struct Backend::Impl {
   std::uint64_t present_frames = 0;
 
   void shutdown() {
+    if (writeback.ready()) writeback.report(stderr);
     writeback.shutdown();
     hwgs::dk::destroy_device(dk);
     cpu.reset();
@@ -83,6 +84,7 @@ bool Backend::init(const Options &options, std::string &error) {
   }
   if (s.writeback.ready()) {
     hwgs::dk::WritebackDk *wb = &s.writeback;
+    hwgs::cpuref::CpuRenderer *cpu = s.cpu.get();
     s.cpu->SetBatchOverride(
         [wb](const hwgs::Batch &batch, hwgs::memory::LocalMemory &local, const hwgs::clut::ClutUnit &clut,
              hwgs::cpuref::DrawStats &draw_stats) -> bool {
@@ -97,12 +99,28 @@ bool Backend::init(const Options &options, std::string &error) {
             draw_stats.primitives += batch.prims.size();
             return true;
           }
-          // Drawn here rather than by CpuRenderer so the fallback has its own perf slot.
+          // The CPU drawer reads and writes SLM: GPU pixels go back first, and the GPU copy is
+          // stale afterwards. Drawn here rather than by CpuRenderer so the fallback has its own perf slot.
+          {
+            gt4::perf::Scope flush(gt4::perf::kGsFlush);
+            wb->flush_to_slm(local, err);
+          }
+          {
+            gt4::perf::Scope cpu_draw(gt4::perf::kGsCpuDraw);
+            hwgs::cpuref::DrawBatch(batch, local, clut, draw_stats);
+          }
           wb->note_cpu_fallback();
-          gt4::perf::Scope cpu_draw(gt4::perf::kGsCpuDraw);
-          hwgs::cpuref::DrawBatch(batch, local, clut, draw_stats);
           return true;
         });
+    s.cpu->SetMemorySyncHook([wb](hwgs::memory::LocalMemory &local) {
+      gt4::perf::Scope flush(gt4::perf::kGsFlush);
+      std::string err;
+      wb->flush_to_slm(local, err);
+    });
+    s.cpu->Memory().SetAccessHook([wb, cpu](std::uint32_t block, std::uint32_t blocks, bool write) {
+      gt4::perf::Scope flush(gt4::perf::kGsFlush);
+      wb->before_memory_access(cpu->Memory().Local(), block, blocks, write);
+    });
   }
   s.report.device_name = "deko3d (Switch)";
   s.report.vendor_id = 0x10DE; // Tegra X1
@@ -133,22 +151,9 @@ void Backend::set_stream_event_handler(StreamEventHandler handler, void *context
 bool Backend::gif_transfer(int path, const std::uint8_t *bytes, std::size_t byte_count) {
   if (path < 1 || path > 3 || !bytes || !impl_->cpu) return false;
   impl_->stats.gif_bytes += byte_count;
-  // Only drop the decoded texture cache when GS local memory actually changed
-  // (host IMAGE / BITBLT commit). Register-only GIF packets must not WaitIdle the GPU.
-  const std::uint64_t commits_before =
-      impl_->cpu->Counters().Get(hwgs::Counter::TransferCommits);
-  const std::uint64_t image_before = impl_->cpu->Counters().Get(hwgs::Counter::ImageQwords);
+  // Transfers inside the packet reach the GPU drawer through the local memory access hook.
   std::vector<std::uint8_t> copy(bytes, bytes + byte_count);
-  const bool ok = impl_->cpu->GifTransfer(static_cast<std::uint32_t>(path), copy);
-  if (ok && impl_->writeback.ready()) {
-    const std::uint64_t commits_after =
-        impl_->cpu->Counters().Get(hwgs::Counter::TransferCommits);
-    const std::uint64_t image_after = impl_->cpu->Counters().Get(hwgs::Counter::ImageQwords);
-    if (commits_after != commits_before || image_after != image_before) {
-      impl_->writeback.invalidate_textures();
-    }
-  }
-  return ok;
+  return impl_->cpu->GifTransfer(static_cast<std::uint32_t>(path), copy);
 }
 
 bool Backend::gif_busy(int path) const {
@@ -195,6 +200,10 @@ std::size_t Backend::read_transfer_fifo(void *destination, std::size_t qwords) {
 
 const std::uint8_t *Backend::map_vram(std::uint32_t offset, std::uint32_t size) {
   if (!impl_->cpu || static_cast<std::uint64_t>(offset) + size > 4u * 1024u * 1024u) return nullptr;
+  if (impl_->writeback.ready()) {
+    std::string err;
+    impl_->writeback.flush_to_slm(impl_->cpu->Memory().Local(), err);
+  }
   return impl_->cpu->Memory().Local().bytes().data() + offset;
 }
 
@@ -224,11 +233,7 @@ bool Backend::scanout(ScanoutRequest &request) {
   request.height = 0;
   request.pixels.clear();
   if (!impl_->cpu) return false;
-  if (impl_->writeback.ready()) {
-    gt4::perf::Scope flush(gt4::perf::kGsFlush);
-    std::string err;
-    impl_->writeback.flush_to_slm(impl_->cpu->Memory().Local(), err);
-  }
+  // EndFrame flushes the last batch, then the memory sync hook writes GPU pixels back before compose.
   gt4::perf::Scope compose(gt4::perf::kGsCompose);
   hwgs::cpuref::FrameImage frame = impl_->cpu->EndFrame();
   impl_->last_frame = frame;
