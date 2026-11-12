@@ -549,8 +549,15 @@ struct WritebackDk::State {
   std::unordered_map<TexKey, std::vector<std::uint32_t>, TexKeyHash> tex_cache;
   std::uint64_t tex_cache_bytes = 0;
 
+  bool in_flight = false;  // a submitted list may still be running
+  bool gpu_error = false;  // the queue faulted: no further GPU work
   void begin_recording() {
     if (!recording) {
+      // dkCmdBufClear rewinds the command memory, which a running list may still be reading.
+      if (in_flight) {
+        dkQueueWaitIdle(queue);
+        in_flight = false;
+      }
       dkCmdBufClear(cmdbuf);
       recording = true;
       descriptors_bound = false;
@@ -558,15 +565,26 @@ struct WritebackDk::State {
   }
   void submit(DkGpuStats &stats) {
     if (recording) {
-      dkQueueSubmitCommands(queue, dkCmdBufFinishList(cmdbuf));
+      const DkCmdList list = dkCmdBufFinishList(cmdbuf);
       recording = false;
+      // Submitting to a faulted queue is a fatal deko3d error.
+      if (gpu_error || dkQueueIsInErrorState(queue)) {
+        gpu_error = true;
+        return;
+      }
+      dkQueueSubmitCommands(queue, list);
+      in_flight = true;
       ++stats.submissions;
     }
   }
-  bool gpu_error = false; // the queue faulted: no further GPU draws
+  // Orders copy-engine and render work recorded in the same list.
+  void barrier() {
+    dkCmdBufBarrier(cmdbuf, DkBarrier_Full, DkInvalidateFlags_Image | DkInvalidateFlags_L2Cache | DkInvalidateFlags_Zcull);
+  }
   void submit_and_wait(DkGpuStats &stats) {
     submit(stats);
     dkQueueWaitIdle(queue);
+    in_flight = false;
     if (!gpu_error && dkQueueIsInErrorState(queue)) {
       gpu_error = true;
       std::fprintf(stderr, "[hw-dk] GPU queue error after %llu submissions: GPU drawer off, CPU draws the rest\n",
@@ -604,6 +622,7 @@ bool flush_surfaces(State &s, DkGpuStats &stats, memory::LocalMemory &local, uns
     return true;
   }
   s.begin_recording();
+  s.barrier();
   for (int i = 0; i < 2; ++i) {
     if (!surfaces[i]) continue;
     const Rect &r = rects[i];
@@ -662,6 +681,7 @@ void seed_surface(State &s, DkGpuStats &stats, memory::LocalMemory &local, Surfa
   DkCopyBuf src{dkMemBlockGetGpuAddr(s.stage_mem) + surf.stage_off, 0, 0};
   DkImageRect rect{static_cast<uint32_t>(seed.x0), static_cast<uint32_t>(seed.y0), 0, rw, rh, 1};
   dkCmdBufCopyBufferToImage(s.cmdbuf, &src, &view, &rect, 0);
+  s.barrier();
   stats.upload_bytes += static_cast<std::uint64_t>(rw) * rh * 4u;
   ++stats.seeds;
   surf.seeded = seed;
