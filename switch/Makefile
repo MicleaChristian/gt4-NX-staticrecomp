@@ -21,6 +21,19 @@ require:
 
 else
 
+# MSYS getcwd() resolves the D:\gt4sr junction to the real path (spaces), which splits
+# unquoted make prerequisites. Prefer the short junction when it points here.
+ifneq ($(wildcard /d/gt4sr/switch/Makefile),)
+  ifneq ($(realpath $(CURDIR)),$(realpath /d/gt4sr/switch))
+  else
+    override CURDIR := /d/gt4sr/switch
+  endif
+endif
+# Force the short path when invoked from the junction (realpath equal is the common case).
+ifeq ($(findstring Gt4 ercomp,$(CURDIR)),Gt4 ercomp)
+  override CURDIR := /d/gt4sr/switch
+endif
+
 include $(DEVKITPRO)/libnx/switch_rules
 
 APP_TITLE   := GT4Recomp
@@ -107,17 +120,7 @@ $(BUILD)/$(TARGET).nro: $(BUILD)/$(TARGET).elf $(BUILD)/$(TARGET).nacp
 
 .PHONY: export
 export:
-	@if command -v cmd.exe >/dev/null 2>&1; then \
-	  cmd.exe /c "D:\gt4sr\switch\tools\export-switch.cmd"; \
-	else \
-	  mkdir -p ../export/switch-gpu/saves ../export/switch-gpu/shaders; \
-	  cp -f "$(BUILD)/$(TARGET).nro" ../export/switch-gpu/gt4recomp.nro; \
-	  if test -f ../private/switch-ee/core.elf; then \
-	    cp -f ../private/switch-ee/core.elf ../export/switch-gpu/core.elf; \
-	  fi; \
-	  rm -f ../export/switch-gpu/coregs.on; \
-	  echo Exported ../export/switch-gpu; \
-	fi
+	@cmd.exe /c "D:\gt4sr\switch\tools\export-switch.cmd"
 
 require: all
 

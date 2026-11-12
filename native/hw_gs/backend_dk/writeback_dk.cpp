@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <unordered_map>
@@ -14,6 +15,7 @@
 
 #if defined(__SWITCH__)
 #include <deko3d.h>
+#include <malloc.h> // memalign
 
 #include "gs_draw_fsh_dksh.hpp"
 #include "gs_draw_vsh_dksh.hpp"
@@ -461,7 +463,9 @@ bool load_shader(DkMemBlock code_mem, uint32_t &code_off, const std::uint8_t *by
 
 // Keep textures GPU-resident: a ring of pitch-linear slots, each with its own image descriptor so
 // draws recorded earlier in the same command list keep sampling their own texture.
-constexpr int kTexSlots = 16;
+// Switch heap + nvmap are tight (especially in applet mode): keep this small. Larger textures
+// reject to the CPU drawer. Release deko3d aborts the process on a failed dkMemBlockCreate.
+constexpr int kTexSlots = 4;
 constexpr uint32_t kTexSlotBytes = 512u * 512u * 4u; // max 512x512 RGBA8 per slot
 constexpr int kWhiteSlot = kTexSlots;                // 1x1 white for untextured batches
 constexpr int kImageDescriptors = kTexSlots + 1;
@@ -486,7 +490,6 @@ struct Surface {
   DkImage image{};
   DkMemBlock mem = nullptr;
   bool is_depth = false;
-  uint32_t stage_off = 0;       // this surface's half of the staging buffer
   bool valid = false;           // view below is meaningful
   memory::BufferView view{0, 0, memory::Psm::Ct32};
   uint32_t fbw = 0;
@@ -548,6 +551,16 @@ struct WritebackDk::State {
   TexSlot white{};
   std::unordered_map<TexKey, std::vector<std::uint32_t>, TexKeyHash> tex_cache;
   std::uint64_t tex_cache_bytes = 0;
+  // CPU backing for memblocks created with maker.storage (we free these; deko3d does not).
+  void *owned_cmd = nullptr;
+  void *owned_code = nullptr;
+  void *owned_colour = nullptr;
+  void *owned_depth = nullptr;
+  void *owned_tex = nullptr;
+  void *owned_data = nullptr;
+  void *owned_stage = nullptr;
+  void *owned_ubo = nullptr;
+  void *owned_desc = nullptr;
 
   bool in_flight = false;  // a submitted list may still be running
   bool gpu_error = false;  // the queue faulted: no further GPU work
@@ -599,47 +612,28 @@ namespace {
 
 using State = WritebackDk::State;
 
-// Writes the dirty parts of the selected surfaces back into SLM with one GPU wait.
+// Writes the dirty parts of the selected surfaces back into SLM. One surface at a time so the
+// staging buffer can stay a single 1024x1024 RGBA/float page (~4 MiB) instead of two.
 bool flush_surfaces(State &s, DkGpuStats &stats, memory::LocalMemory &local, unsigned mask, std::string &error) {
   Surface *surfaces[2] = {(mask & kColourBit) ? &s.colour : nullptr, (mask & kDepthBit) ? &s.depth : nullptr};
-  Rect rects[2];
   bool any = false;
   for (int i = 0; i < 2; ++i) {
-    if (!surfaces[i] || !surfaces[i]->valid || surfaces[i]->dirty.empty()) {
-      surfaces[i] = nullptr;
-      continue;
-    }
-    rects[i] = intersect(surfaces[i]->dirty, Rect{0, 0, kDkSurface - 1, kDkSurface - 1});
+    if (!surfaces[i] || !surfaces[i]->valid || surfaces[i]->dirty.empty()) continue;
+    Rect r = intersect(surfaces[i]->dirty, Rect{0, 0, kDkSurface - 1, kDkSurface - 1});
     surfaces[i]->dirty = {};
-    if (rects[i].empty()) {
-      surfaces[i] = nullptr;
-      continue;
-    }
+    if (r.empty()) continue;
     any = true;
-  }
-  if (!any) {
-    s.submit(stats);
-    return true;
-  }
-  s.begin_recording();
-  s.barrier();
-  for (int i = 0; i < 2; ++i) {
-    if (!surfaces[i]) continue;
-    const Rect &r = rects[i];
-    DkImageView view;
-    dkImageViewDefaults(&view, &surfaces[i]->image);
-    DkImageRect rect{static_cast<uint32_t>(r.x0), static_cast<uint32_t>(r.y0), 0, static_cast<uint32_t>(r.x1 - r.x0 + 1),
-                     static_cast<uint32_t>(r.y1 - r.y0 + 1), 1};
-    DkCopyBuf dst{dkMemBlockGetGpuAddr(s.stage_mem) + surfaces[i]->stage_off, 0, 0};
-    dkCmdBufCopyImageToBuffer(s.cmdbuf, &view, &rect, &dst, 0);
-  }
-  s.submit_and_wait(stats);
-  for (int i = 0; i < 2; ++i) {
-    if (!surfaces[i]) continue;
     Surface &surf = *surfaces[i];
-    const Rect &r = rects[i];
     const uint32_t rw = static_cast<uint32_t>(r.x1 - r.x0 + 1), rh = static_cast<uint32_t>(r.y1 - r.y0 + 1);
-    auto *words = reinterpret_cast<std::uint32_t *>(s.stage_cpu + surf.stage_off);
+    s.begin_recording();
+    s.barrier();
+    DkImageView view;
+    dkImageViewDefaults(&view, &surf.image);
+    DkImageRect rect{static_cast<uint32_t>(r.x0), static_cast<uint32_t>(r.y0), 0, rw, rh, 1};
+    DkCopyBuf dst{dkMemBlockGetGpuAddr(s.stage_mem), 0, 0};
+    dkCmdBufCopyImageToBuffer(s.cmdbuf, &view, &rect, &dst, 0);
+    s.submit_and_wait(stats);
+    auto *words = reinterpret_cast<std::uint32_t *>(s.stage_cpu);
     if (surf.is_depth) {
       const double inv = 1.0 / z_scale(surf.psm_code);
       const uint32_t zmax = z_max(surf.psm_code);
@@ -652,8 +646,9 @@ bool flush_surfaces(State &s, DkGpuStats &stats, memory::LocalMemory &local, uns
     }
     local.writeRect(surf.view, static_cast<uint32_t>(r.x0), static_cast<uint32_t>(r.y0), rw, rh, words);
     stats.readback_bytes += static_cast<std::uint64_t>(rw) * rh * 4u;
+    ++stats.flushes;
   }
-  ++stats.flushes;
+  if (!any) s.submit(stats);
   (void)error;
   return true;
 }
@@ -663,9 +658,9 @@ void seed_surface(State &s, DkGpuStats &stats, memory::LocalMemory &local, Surfa
   const Rect seed = unite(surf.seeded, area);
   const uint32_t rw = static_cast<uint32_t>(seed.x1 - seed.x0 + 1);
   const uint32_t rh = static_cast<uint32_t>(seed.y1 - seed.y0 + 1);
-  // The staging half may still feed a recorded copy; wait before overwriting it.
+  // Staging is shared across surfaces; wait before overwriting it.
   s.submit_and_wait(stats);
-  auto *words = reinterpret_cast<std::uint32_t *>(s.stage_cpu + surf.stage_off);
+  auto *words = reinterpret_cast<std::uint32_t *>(s.stage_cpu);
   local.readRect(surf.view, static_cast<uint32_t>(seed.x0), static_cast<uint32_t>(seed.y0), rw, rh, words);
   if (surf.is_depth) {
     const double scale = z_scale(surf.psm_code);
@@ -678,7 +673,7 @@ void seed_surface(State &s, DkGpuStats &stats, memory::LocalMemory &local, Surfa
   s.begin_recording();
   DkImageView view;
   dkImageViewDefaults(&view, &surf.image);
-  DkCopyBuf src{dkMemBlockGetGpuAddr(s.stage_mem) + surf.stage_off, 0, 0};
+  DkCopyBuf src{dkMemBlockGetGpuAddr(s.stage_mem), 0, 0};
   DkImageRect rect{static_cast<uint32_t>(seed.x0), static_cast<uint32_t>(seed.y0), 0, rw, rh, 1};
   dkCmdBufCopyBufferToImage(s.cmdbuf, &src, &view, &rect, 0);
   s.barrier();
@@ -687,7 +682,38 @@ void seed_surface(State &s, DkGpuStats &stats, memory::LocalMemory &local, Surfa
   surf.seeded = seed;
 }
 
-bool make_surface_image(DkDevice device, Surface &surf, DkImageFormat format, uint32_t flags, std::string &error) {
+// Pre-allocate CPU storage so a heap OOM returns false instead of release-deko3d's
+// diagAbortWithResult (cbDebug is debug-library only; release always aborts on DK_ERROR).
+DkMemBlock create_memblock(DkDevice device, uint32_t size, uint32_t flags, void **owned_storage,
+                           std::string &error, const char *name) {
+  size = (size + DK_MEMBLOCK_ALIGNMENT - 1) & ~(DK_MEMBLOCK_ALIGNMENT - 1);
+  std::fprintf(stderr, "[hw-dk] alloc %s (%u KiB)\n", name, size / 1024u);
+  std::fflush(stderr);
+  // memalign: aligned_alloc is spotty on newlib; deko3d requires DK_MEMBLOCK_ALIGNMENT.
+  void *storage = memalign(DK_MEMBLOCK_ALIGNMENT, size);
+  if (!storage) {
+    error = std::string(name) + " heap OOM";
+    std::fprintf(stderr, "[hw-dk] %s\n", error.c_str());
+    return nullptr;
+  }
+  std::memset(storage, 0, size);
+  DkMemBlockMaker mm;
+  dkMemBlockMakerDefaults(&mm, device, size);
+  mm.flags = flags;
+  mm.storage = storage;
+  DkMemBlock block = dkMemBlockCreate(&mm);
+  if (!block) {
+    // Reachable only with the debug library; release aborts inside create.
+    std::free(storage);
+    error = std::string(name) + " dkMemBlockCreate failed";
+    return nullptr;
+  }
+  *owned_storage = storage;
+  return block;
+}
+
+bool make_surface_image(DkDevice device, Surface &surf, DkImageFormat format, uint32_t flags, void **owned,
+                        std::string &error, const char *name) {
   DkImageLayoutMaker lm;
   dkImageLayoutMakerDefaults(&lm, device);
   lm.flags = flags;
@@ -699,14 +725,8 @@ bool make_surface_image(DkDevice device, Surface &surf, DkImageFormat format, ui
   uint32_t size = static_cast<uint32_t>(dkImageLayoutGetSize(&layout));
   const uint32_t align = dkImageLayoutGetAlignment(&layout);
   size = (size + align - 1) & ~(align - 1);
-  DkMemBlockMaker mm;
-  dkMemBlockMakerDefaults(&mm, device, size);
-  mm.flags = DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
-  surf.mem = dkMemBlockCreate(&mm);
-  if (!surf.mem) {
-    error = "surface image mem failed";
-    return false;
-  }
+  surf.mem = create_memblock(device, size, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, owned, error, name);
+  if (!surf.mem) return false;
   dkImageInitialize(&surf.image, &layout, surf.mem, 0);
   return true;
 }
@@ -742,13 +762,13 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   s.device = static_cast<DkDevice>(handles.device);
   s.queue = static_cast<DkQueue>(handles.queue);
 
-  s.cmd_bytes = 1024 * 1024;
-  DkMemBlockMaker mm;
-  dkMemBlockMakerDefaults(&mm, s.device, s.cmd_bytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-  s.cmd_mem = dkMemBlockCreate(&mm);
+  // Budget (MiB): colour~4 + depth~4 + tex~4 + verts~2 + stage~4 + misc~1 ≈ 19, down from ~40.
+  // Present's 1280x720 swapchain already sits beside this. Release deko3d aborts on a failed
+  // dkMemBlockCreate (cbDebug is debug-only), so we pre-allocate heap storage first.
+  s.cmd_bytes = 256 * 1024;
+  s.cmd_mem = create_memblock(s.device, s.cmd_bytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                              &s.owned_cmd, error, "cmd");
   if (!s.cmd_mem) {
-    error = "cmd mem failed";
     shutdown();
     return false;
   }
@@ -763,11 +783,10 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   dkCmdBufAddMemory(s.cmdbuf, s.cmd_mem, 0, s.cmd_bytes);
 
   const uint32_t code_bytes = 256 * 1024;
-  dkMemBlockMakerDefaults(&mm, s.device, code_bytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code;
-  s.code_mem = dkMemBlockCreate(&mm);
+  s.code_mem =
+      create_memblock(s.device, code_bytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code,
+                      &s.owned_code, error, "code");
   if (!s.code_mem) {
-    error = "code mem failed";
     shutdown();
     return false;
   }
@@ -779,28 +798,26 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   }
 
   std::fprintf(stderr, "[hw-dk] init: shaders loaded\n");
-  // Copy-engine seeding and readback write the images directly, so neither uses compression.
   if (!make_surface_image(s.device, s.colour, DkImageFormat_RGBA8_Unorm,
-                          DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine, error) ||
-      !make_surface_image(s.device, s.depth, DkImageFormat_ZF32, DkImageFlags_UsageRender, error)) {
+                          DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine, &s.owned_colour, error,
+                          "colour") ||
+      !make_surface_image(s.device, s.depth, DkImageFormat_ZF32, DkImageFlags_UsageRender, &s.owned_depth, error,
+                          "depth")) {
     shutdown();
     return false;
   }
   std::fprintf(stderr, "[hw-dk] init: colour and depth surfaces created\n");
-  s.colour.stage_off = 0;
-  s.depth.stage_off = kSurfaceBytes;
+  s.depth.is_depth = true;
 
   const uint32_t tex_bytes = kTexSlots * kTexSlotBytes + 0x1000u; // last page: the white texel
-  dkMemBlockMakerDefaults(&mm, s.device, tex_bytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
-  s.tex_mem = dkMemBlockCreate(&mm);
+  s.tex_mem = create_memblock(s.device, tex_bytes,
+                              DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image,
+                              &s.owned_tex, error, "tex");
   if (!s.tex_mem) {
-    error = "tex mem failed";
     shutdown();
     return false;
   }
   s.tex_cpu = static_cast<std::uint8_t *>(dkMemBlockGetCpuAddr(s.tex_mem));
-  std::memset(s.tex_cpu, 0, tex_bytes);
   for (int i = 0; i < kTexSlots; ++i) s.tex_slots[i].mem_off = static_cast<uint32_t>(i) * kTexSlotBytes;
   s.white.mem_off = kTexSlots * kTexSlotBytes;
   reinterpret_cast<std::uint32_t *>(s.tex_cpu + s.white.mem_off)[0] = 0xFFFFFFFFu;
@@ -816,42 +833,34 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
     dkImageInitialize(&s.white.image, &s.white.layout, s.tex_mem, s.white.mem_off);
   }
 
-  const uint32_t vert_bytes = 8u * 1024u * 1024u;
-  dkMemBlockMakerDefaults(&mm, s.device, vert_bytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-  s.data_mem = dkMemBlockCreate(&mm);
+  const uint32_t vert_bytes = 2u * 1024u * 1024u;
+  s.data_mem = create_memblock(s.device, vert_bytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                               &s.owned_data, error, "verts");
   if (!s.data_mem) {
-    error = "vertex mem failed";
     shutdown();
     return false;
   }
   s.data_cpu = static_cast<std::uint8_t *>(dkMemBlockGetCpuAddr(s.data_mem));
   s.vert_capacity = vert_bytes / sizeof(GpuVert);
 
-  dkMemBlockMakerDefaults(&mm, s.device, 2u * kSurfaceBytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-  s.stage_mem = dkMemBlockCreate(&mm);
+  s.stage_mem = create_memblock(s.device, kSurfaceBytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                                &s.owned_stage, error, "stage");
   if (!s.stage_mem) {
-    error = "stage mem failed";
     shutdown();
     return false;
   }
   s.stage_cpu = static_cast<std::uint8_t *>(dkMemBlockGetCpuAddr(s.stage_mem));
 
-  dkMemBlockMakerDefaults(&mm, s.device, kParamsBytes);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-  s.ubo_mem = dkMemBlockCreate(&mm);
+  s.ubo_mem = create_memblock(s.device, kParamsBytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                              &s.owned_ubo, error, "ubo");
   if (!s.ubo_mem) {
-    error = "uniform mem failed";
     shutdown();
     return false;
   }
 
-  dkMemBlockMakerDefaults(&mm, s.device, 0x1000);
-  mm.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
-  s.desc_mem = dkMemBlockCreate(&mm);
+  s.desc_mem = create_memblock(s.device, 0x1000, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
+                               &s.owned_desc, error, "desc");
   if (!s.desc_mem) {
-    error = "desc mem failed";
     shutdown();
     return false;
   }
@@ -906,6 +915,10 @@ void WritebackDk::shutdown() {
   for (DkMemBlock m : {s.cmd_mem, s.desc_mem, s.ubo_mem, s.stage_mem, s.data_mem, s.tex_mem, s.colour.mem,
                        s.depth.mem, s.code_mem}) {
     if (m) dkMemBlockDestroy(m);
+  }
+  for (void *p : {s.owned_cmd, s.owned_code, s.owned_colour, s.owned_depth, s.owned_tex, s.owned_data, s.owned_stage,
+                  s.owned_ubo, s.owned_desc}) {
+    std::free(p);
   }
   delete state_;
   state_ = nullptr;
@@ -1219,7 +1232,7 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
     } else {
       std::vector<std::uint32_t> decoded;
       if (!decode_texture(batch, local, clut, decoded, tw, th)) return reject(stats_, Reject::Texture);
-      constexpr std::uint64_t kCacheCap = 48ull * 1024ull * 1024ull;
+      constexpr std::uint64_t kCacheCap = 12ull * 1024ull * 1024ull;
       const std::uint64_t add = decoded.size() * 4u;
       while (s.tex_cache_bytes + add > kCacheCap && !s.tex_cache.empty()) {
         auto erase_it = s.tex_cache.begin();
