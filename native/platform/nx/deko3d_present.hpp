@@ -25,8 +25,7 @@ void deko3d_present_destroy();
 bool soft_present_begin();
 void soft_present_end();
 
-// Upload tightly packed RGBA8 (uint32 little-endian R,G,B,A) and flip.
-// Always draws a cyan frame OSD so a black GS does not look "frozen".
+// Upload tightly packed RGBA8 (uint32 little-endian R,G,B,A) and flip. No debug OSD.
 bool deko3d_present_frame(const std::uint8_t *rgba, std::size_t bytes, int width, int height,
                           std::uint64_t frame_osd);
 

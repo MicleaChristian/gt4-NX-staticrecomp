@@ -220,15 +220,16 @@ bool reject(DkGpuStats &stats, Reject why) {
   return false;
 }
 
-// Soft gates only: count approximations, but still draw. Hard reject only when the frame PSM
-// cannot be a colour target (Z formats as FRAME). Switch cannot afford a CPU DrawBatch fallback.
+// Soft gates only: count approximations, but still draw. Hard reject only Z-as-FRAME.
+// CT16/CT16S are drawn into the RGBA8 GPU target (approx); menus use them heavily.
 bool accept_batch(const hwgs::Batch &batch, bool /*depth_available*/, DkGpuStats &stats) {
   const auto &ctx = batch.state.ctx;
   const uint32_t frame_psm = hwgs::frame::Psm(ctx.frame);
-  if (frame_psm != hwgs::psm::kCt32 && frame_psm != hwgs::psm::kCt24) {
-    return reject(stats, Reject::FramePsm);
+  if (hwgs::IsZPsm(frame_psm)) return reject(stats, Reject::FramePsm);
+  if (frame_psm != hwgs::psm::kCt32 && frame_psm != hwgs::psm::kCt24 && frame_psm != hwgs::psm::kCt16 &&
+      frame_psm != hwgs::psm::kCt16S) {
+    ++stats.rejects[static_cast<int>(Reject::FramePsm)]; // soft: still draw as CT32
   }
-  // Everything else is approximated: missing blend → opaque, no depth → 2D order, bad tex → white.
   if (hwgs::frame::Fbmsk(ctx.frame) != 0) ++stats.rejects[static_cast<int>(Reject::FrameMask)];
   if (hwgs::test::Date(ctx.test)) ++stats.rejects[static_cast<int>(Reject::DestAlphaTest)];
   if ((batch.state.env.colclamp & 1u) == 0) ++stats.rejects[static_cast<int>(Reject::ColClamp)];
@@ -1021,8 +1022,8 @@ void WritebackDk::memory_written() {
 
 void WritebackDk::note_cpu_fallback() {
 #if defined(__SWITCH__)
-  if (!state_) return;
-  memory_written();
+  // Counter only. Do NOT call memory_written(): that wiped seeded surfaces + the whole texture
+  // cache on every refused batch (session log: 5746 fallbacks) and destroyed the GPU path.
   ++stats_.cpu_fallback;
 #endif
 }
@@ -1172,8 +1173,7 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   DepthUse depth = depth_use(ctx);
   if (depth.never) return true; // every pixel fails the depth test: nothing is written
   // Depth optional: draw in submission order when the depth path is off or the format is unknown.
-  const bool uses_depth =
-      depth.any() && s.depth_available && z_format_known(z_psm_code(ctx.zbuf));
+  bool uses_depth = depth.any() && s.depth_available && z_format_known(z_psm_code(ctx.zbuf));
   if (depth.any() && !uses_depth) ++stats_.rejects[static_cast<int>(Reject::DepthUnavailable)];
 
   // Pixel area: scissor (inclusive) intersected with the batch coverage, clamped to the surface.
@@ -1196,8 +1196,10 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   const auto frame_psm = memory::decodePsm(frame_psm_code);
   if (!frame_psm) return reject(stats_, Reject::FramePsm);
   const memory::BufferView frame_view{memory::blockOfPage(hwgs::frame::Fbp(ctx.frame)), fbw, *frame_psm};
+  // Retarget without WaitIdle flush. Abandon dirty GPU pixels for the old FBP — mid-batch
+  // SLM writeback was serialising the EE behind every framebuffer swap (menus/FMV).
   if (!s.colour.same_target(frame_view)) {
-    if (!flush_surfaces(s, stats_, local, kColourBit, error)) return false;
+    s.colour.dirty = {};
     s.colour.seeded = {};
   }
   s.colour.view = frame_view;
@@ -1207,15 +1209,20 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
 
   if (uses_depth) {
     const uint32_t zcode = z_psm_code(ctx.zbuf);
-    const memory::BufferView z_view{memory::blockOfPage(hwgs::zbuf::Zbp(ctx.zbuf)), fbw, *memory::decodePsm(zcode)};
-    if (!s.depth.same_target(z_view)) {
-      if (!flush_surfaces(s, stats_, local, kDepthBit, error)) return false;
-      s.depth.seeded = {};
+    const auto z_psm = memory::decodePsm(zcode);
+    if (!z_psm) {
+      uses_depth = false;
+    } else {
+      const memory::BufferView z_view{memory::blockOfPage(hwgs::zbuf::Zbp(ctx.zbuf)), fbw, *z_psm};
+      if (!s.depth.same_target(z_view)) {
+        s.depth.dirty = {};
+        s.depth.seeded = {};
+      }
+      s.depth.view = z_view;
+      s.depth.fbw = fbw;
+      s.depth.psm_code = zcode;
+      s.depth.valid = true;
     }
-    s.depth.view = z_view;
-    s.depth.fbw = fbw;
-    s.depth.psm_code = zcode;
-    s.depth.valid = true;
   }
 
   // Texture sampling from a dirty GPU frame: prefer speed — invalidate the tex cache after a
@@ -1372,7 +1379,7 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   }
   if (s.vert_offset + verts.size() > s.vert_capacity) {
     s.submit(stats_);
-    s.submit_and_wait(stats_); // must reclaim the vertex ring
+    s.submit_and_wait(stats_); // vertex ring is single-buffered; must reclaim before overwrite
   }
   const bool lines = batch.prims.front().type == hwgs::PrimType::Line ||
                      batch.prims.front().type == hwgs::PrimType::LineStrip;

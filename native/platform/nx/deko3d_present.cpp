@@ -35,27 +35,7 @@ DkImage g_stage_image{};
 uint32_t g_stage_pitch = 0; // bytes per row
 std::uint8_t *g_stage_cpu = nullptr;
 
-void draw_osd_rgba(std::uint32_t *dst, int dst_w, int dst_h, int pitch_px, std::uint64_t frame) {
-  const int bar_h = 28;
-  const int bar_y = dst_h - bar_h - 40;
-  const std::uint64_t span = 300;
-  const int bar_w = static_cast<int>((std::min(frame, span) * static_cast<std::uint64_t>(dst_w)) / span);
-  const std::uint32_t cyan = RGBA8_MAXALPHA(0, 200, 255);
-  const std::uint32_t dark = RGBA8_MAXALPHA(0, 40, 60);
-  for (int y = 0; y < bar_h; ++y) {
-    std::uint32_t *row = dst + (bar_y + y) * pitch_px;
-    for (int x = 0; x < dst_w; ++x) row[x] = (x < bar_w) ? cyan : dark;
-  }
-  const int ticks = static_cast<int>(std::min<std::uint64_t>(frame / 60u, static_cast<std::uint64_t>(dst_w / 8)));
-  for (int t = 0; t < ticks; ++t) {
-    const int x0 = 8 + t * 8;
-    for (int y = 8; y < 20; ++y) {
-      std::uint32_t *row = dst + y * pitch_px;
-      row[x0] = RGBA8_MAXALPHA(255, 255, 255);
-      row[x0 + 1] = RGBA8_MAXALPHA(255, 255, 255);
-    }
-  }
-}
+// Debug cyan bar / white tick OSD removed — it was painting over every game frame.
 
 void destroy_libnx_fb() {
   if (!g_fb_libnx) return;
@@ -212,7 +192,8 @@ bool present_staging(std::uint64_t frame_osd) {
   const int fb_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
   const int fb_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
   const int pitch_px = static_cast<int>(g_stage_pitch / 4u);
-  draw_osd_rgba(reinterpret_cast<std::uint32_t *>(g_stage_cpu), fb_w, fb_h, pitch_px, frame_osd);
+  (void)frame_osd;
+  (void)pitch_px;
 
   const int slot = dkQueueAcquireImage(g_queue, g_swapchain);
   dkCmdBufClear(g_cmdbuf);
@@ -278,7 +259,8 @@ bool present_libnx_rgba(const std::uint8_t *rgba, int width, int height, std::ui
                   static_cast<std::size_t>(dw) * 4u);
     }
   }
-  draw_osd_rgba(dst, dst_w, dst_h, pitch_px, frame_osd);
+  (void)frame_osd;
+  (void)pitch_px;
   framebufferEnd(&g_libnx_fb);
   return true;
 }

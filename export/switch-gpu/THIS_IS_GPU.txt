@@ -1,10 +1,15 @@
 GT4Recomp Switch — CoreGS / deko3d GPU build (TASK-174)
 
-This NRO never soft-rasters GS batches on the CPU.
-- Batches go through WritebackDk (deko3d). Rejected batches are dropped, not DrawBatch'd.
-- Present framebuffer is 640x448 (OS scales); no CPU upscale to 1280x720.
-- Texture cache survives frame-buffer BITBLTs (FMV / car-select thrash fix).
-- Interlaced FFMD menus hold the previous field on odd presents.
+From device logs (session_summary): wall ~163ms was dominated by refused GPU
+batches (5746 fallbacks vs 242 draws). Fixes in this NRO:
 
-Copy gt4recomp.nro + your ISO to sdmc:/switch/gt4recomp/
-Check stderr.log for: gpu_draws, gpu_cpu_fallback (~0), gpu_composed / scanouts.
+- Cyan bar / white tick OSD REMOVED (was still painted every present).
+- note_cpu_fallback no longer wipes texture cache + surface seed (that poison
+  made every refused batch destroy the GPU path).
+- Accept CT16/CT16S frame targets (menus); only hard-reject Z-as-FRAME.
+- Retarget colour/depth without mid-batch WaitIdle flush to SLM.
+- Reject report every 60 presents (was 600 — never showed in your stderr).
+
+Copy THIS gt4recomp.nro (check file time) to sdmc:/switch/GT4/
+Expect stderr: [hw-dk] rejects=... and gpu_draws rising; no cyan bar.
+Paste new session_summary.txt after a short run.

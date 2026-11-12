@@ -303,7 +303,7 @@ bool Backend::end_frame(PresentPhase phase) {
   Impl &s = *impl_;
   s.stats.presents++;
   // Cumulative; repeated so a session ended with Plus still leaves the numbers in stderr.log.
-  if (s.writeback.ready() && s.stats.presents % 600 == 0) {
+  if (s.writeback.ready() && (s.stats.presents == 1 || s.stats.presents % 60 == 0)) {
     s.writeback.report(stderr);
     std::fprintf(stderr, "[hw-dk] field_holds=%llu\n", static_cast<unsigned long long>(s.field_holds));
   }
