@@ -19,6 +19,17 @@ CORE.GT4
 /build/
 /build-*/
 /out/
+/switch/build/
+/switch/dist/
+/export/**/*.nro
+/export/**/*.NRO
+/export/**/*.elf
+/export/**/*.ELF
+# Device logs copied back from the SD card.
+/export/**/*.log
+/export/**/last_boot.txt
+/export/**/session_summary.txt
+/export/**/saves/*.ps2
 /.vs/
 CMakeUserPresets.json
 __pycache__/

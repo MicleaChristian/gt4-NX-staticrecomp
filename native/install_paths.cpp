@@ -1,10 +1,9 @@
 #include "install_paths.hpp"
 
-#include <windows.h>
+#include "platform/paths.hpp"
 
 #include <cstdio>
 #include <cstdlib>
-#include <iterator>
 #include <string>
 #include <system_error>
 
@@ -19,12 +18,7 @@ std::string narrow(const std::filesystem::path &path) { return path.string(); }
 
 } // namespace
 
-std::filesystem::path executable_directory() {
-  wchar_t path[32768];
-  const DWORD length = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(std::size(path)));
-  if (length == 0 || length >= std::size(path)) return {};
-  return std::filesystem::path(path).parent_path();
-}
+std::filesystem::path executable_directory() { return gt4::platform::executable_directory(); }
 
 std::filesystem::path choose_shader_directory(const std::filesystem::path &build_time_directory) {
   const std::filesystem::path directory = executable_directory();

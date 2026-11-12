@@ -10,6 +10,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -108,6 +109,10 @@ public:
     // SyncSink: no flush is requested by SIGNAL, FINISH or LABEL in the reference.
     bool OnSync(SyncKind kind, uint32_t id, uint32_t idMask) override;
 
+    // Optional GPU / alternate drawer. When set and the callback returns true, DrawBatch is skipped.
+    using BatchOverride = std::function<bool(const Batch &, memory::LocalMemory &, const clut::ClutUnit &, DrawStats &)>;
+    void SetBatchOverride(BatchOverride override) { batch_override_ = std::move(override); }
+
     const DrawStats& Stats() const { return stats_; }
     const CounterSet& Counters() const { return frontEnd_.Counters(); }
     cpuref::LocalMemorySink& Memory() { return memory_; }
@@ -128,6 +133,7 @@ private:
     std::array<uint8_t, 3> background_{};  // BGCOLOR R, G, B (01.7)
     bool csrField_ = false;
     std::optional<display::Image> lastImage_;
+    BatchOverride batch_override_{};
 };
 
 // Encodes an image as a binary P6 PPM (RGB, alpha dropped, maxval 255).

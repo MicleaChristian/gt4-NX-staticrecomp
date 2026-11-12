@@ -1,5 +1,24 @@
 # Current Status
 
+## Switch 60 FPS plan (2026-11-12)
+
+**TASK-174** Phases 0–5 implemented in tree (device gates pending owner retest). NRO ~65 MiB (VU1 AOT linked).
+
+- Present: fence ring + GPU scale blit (no per-frame WaitIdle / no cyan OSD).
+- VU1 AOT: 2048 programs (`private/switch-vu1-gen`) + overlayed `vu_micro`; interpreter is fallback.
+- IPU: `ipu_fast` overlay for FMV. WritebackDk: deferred seed, one SLM flush/vblank; GPU PCRTC still open.
+- Exports: `export/switch/` + `export/switch-gpu/` (`coregs.on`). Device: confirm G1–G4 via `perf.log`.
+- Logs: `perf.log` (FPS, jitter p95, VU1 AOT hit %, GIF/GS/present/other ms, GPU draws/fallbacks),
+  `session_summary.txt` on exit, `[perf]` lines in `stderr.log` — see `export/switch-gpu/PERF.md`.
+
+## Switch homebrew NRO is the primary objective (2026-11-11)
+
+This checkout’s active objective is **TASK-174**: a Nintendo Switch 1 Atmosphere `.nro` that sits next to the
+player’s GT4 USA v2.00 ISO and runs the already-translated game (decision
+[0077](decisions/0077-switch-primary-target.md), plan [SWITCH-PORT-PLAN](SWITCH-PORT-PLAN.md)). Prebuilt ARM64 only;
+CoreGS + deko3d; no GSdx; no on-device recompile. The published Linux → Android phase order is superseded here.
+Branch `task/174-switch-nro-port`.
+
 ## 1.3.0-rc14: closing as a pre-release (2026-11-04, afternoon)
 
 On top of the slice407 test build: the full trigger range on by default with a fixed-width meter (TASK-161), the shader

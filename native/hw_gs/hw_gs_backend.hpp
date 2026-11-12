@@ -132,6 +132,10 @@ struct RenderCounters {
   std::uint64_t gpu_barriers = 0;
   std::uint64_t writeback_reasons[9] = {};  // other, texture, CLUT, transfer, display, eviction, load overlap,
                                             // fallback batch, CPU sprite
+  // Switch WritebackDk (BackendDk): CPU DrawBatch fallbacks, texture cache hits, SLM flushes.
+  std::uint64_t gpu_cpu_fallback = 0;
+  std::uint64_t gpu_tex_cache_hits = 0;
+  std::uint64_t gpu_flushes = 0;
 };
 
 // Result of the feature report (chapter 12.6).

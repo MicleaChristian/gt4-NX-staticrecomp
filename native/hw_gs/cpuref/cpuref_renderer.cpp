@@ -203,7 +203,10 @@ FrameImage CpuRenderer::EndFrame() {
     return out;
 }
 
-void CpuRenderer::OnBatch(Batch&& batch) { DrawBatch(batch, memory_.Local(), frontEnd_.Clut(), stats_); }
+void CpuRenderer::OnBatch(Batch&& batch) {
+    if (batch_override_ && batch_override_(batch, memory_.Local(), frontEnd_.Clut(), stats_)) return;
+    DrawBatch(batch, memory_.Local(), frontEnd_.Clut(), stats_);
+}
 
 bool CpuRenderer::OnSync(SyncKind, uint32_t, uint32_t) { return false; }
 

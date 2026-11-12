@@ -4,7 +4,9 @@
 
 #include "core2_upload.hpp"
 
+#if defined(__SSE2__)
 #include <emmintrin.h>
+#endif
 
 #include <algorithm>
 #include <bit>
@@ -168,12 +170,22 @@ const Ct32Columns &Ct32ColumnTable(const std::vector<std::uint32_t> &offsets) {
     return table;
 }
 
-// Rows in pairs (an even GS row and the next one), whole 8-pixel columns with SSE2, the rest through StoreRowSpan.
+// Rows in pairs (an even GS row and the next one), whole 8-pixel columns with SSE2 when available;
+// otherwise StoreRowSpan for the whole rectangle (TASK-174 / Switch arm64).
 std::uint32_t HostToLocalCt32(std::uint8_t *memoryBytes, const BufferView &view, std::uint32_t x0, std::uint32_t y0,
                               std::uint32_t width, std::uint32_t height, const std::uint8_t *data,
                               const std::uint32_t *pageOffsets, const Ct32Columns &columns,
                               std::uint64_t *changedBlocks) {
     constexpr std::uint32_t kPageWidth = 64, kPageHeight = 32;
+#if !defined(__SSE2__)
+    (void)columns;
+    std::uint32_t diff = 0;
+    for (std::uint32_t row = 0; row < height; ++row) {
+        diff |= StoreRowSpan<32>(memoryBytes, view, x0, y0, width, data, pageOffsets, kPageWidth, kPageHeight, row, 0,
+                                 width, changedBlocks);
+    }
+    return diff;
+#else
     std::uint32_t diff = 0;
     __m128i changed = _mm_setzero_si128();
     const std::uint32_t perRow = std::max<std::uint32_t>(1u, view.bufferWidth * 64u / kPageWidth);
@@ -229,6 +241,7 @@ std::uint32_t HostToLocalCt32(std::uint8_t *memoryBytes, const BufferView &view,
     }
     if (_mm_movemask_epi8(_mm_cmpeq_epi8(changed, _mm_setzero_si128())) != 0xFFFF) diff |= 1u;
     return diff;
+#endif
 }
 
 template <std::uint32_t Bpp>

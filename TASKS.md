@@ -23,9 +23,10 @@ list (private repository `moesuito/gt4-staticrecomp-legacy`). Third renumbering
 
 | Phase | Platform | Goal |
 |---|---|---|
-| **Phase 1** (current) | Windows PC | Original game running natively: correct speed, smooth 60 FPS, no interpreter on the normal path, PCSX2 GS renderer in a separate process (decision 0070), CoreGS 1.1 fallback |
-| **Phase 2** | Android | ARM64 build with the ARMSX2 mobile GS pipeline (Vulkan) |
-| **Phase 3** | iOS | ARM64 build with the ARMSX2 Metal GS pipeline |
+| **Switch (this checkout, current)** | Nintendo Switch 1 homebrew | Prebuilt ARM64 `.nro` next to the player ISO; CoreGS + deko3d; no JIT; TASK-174 / [decision 0077](docs/decisions/0077-switch-primary-target.md) |
+| **Phase 1** | Windows PC | Original game running natively: correct speed, smooth 60 FPS, no interpreter on the normal path, PCSX2 GS renderer in a separate process (decision 0070), CoreGS 1.1 fallback |
+| **Phase 2** | Android | ARM64 build with the ARMSX2 mobile GS pipeline (Vulkan) — deferred behind Switch in this checkout |
+| **Phase 3** | iOS | ARM64 build with the ARMSX2 Metal GS pipeline — deferred behind Switch in this checkout |
 
 **Renderer decision (2026-10-15, [decision 0070](docs/decisions/0070-pcsx2-gs-separate-process.md)):**
 PC uses the **PCSX2 GS** in a separate GPL process, `gt4-gs.exe`, built from our fork
@@ -3179,6 +3180,19 @@ launcher refuses it today with "a different game program than Spec II v1.10".
   aspect points and the camera hooks (same game addresses), its own executable, pins and launcher target. About the size of one
   Spec II build plus tests; the image's own assets need their own checks.
 - State (2026-11-04): recorded; not in rc14. The owner decides if and when (players can also update their image to 1.10).
+
+### TASK-174 — Nintendo Switch homebrew NRO port (primary objective of this checkout)
+
+Pivot: ship `gt4recomp.nro` for Atmosphere Switch 1; player ISO beside the NRO; prebuilt ARM64 AOT; CoreGS via
+deko3d; no GSdx; no on-device recompile. Decision [0077](docs/decisions/0077-switch-primary-target.md), plan
+[SWITCH-PORT-PLAN](docs/SWITCH-PORT-PLAN.md), sources under `native/platform/` and `switch/`.
+
+- Acceptance: NRO builds with DevKitPro; finds a sibling `.iso`; platform seam keeps Windows building; later stages reach
+  boot then playable races (30 FPS acceptable for the first Switch playable milestone). CoreGS+deko3d interactive race is
+  the playability gate (WritebackDk uber-shader port); soft/cpuref paths prove the wire-up.
+- Branch: `task/174-switch-nro-port`.
+- State (2026-11-12): 🔄 In progress — CoreGS BackendDk + deko3d `copyBufferToImage` present linked into the NRO
+  (`export/switch/gt4recomp.nro`); GIF/privileged hooks; donor CPU GS fallback. Remaining: UAM writeback Execute for race FPS.
 
 ### TASK-173 — Spec II: any image with 1.10's code installs (owner, 2026-11-04; done in rc14)
 

@@ -127,7 +127,7 @@ github.com/Kaezzey/gt4-staticrecomp is read-only.
 
 ## Workflow
 
-- Speak Brazilian Portuguese with the owner, in plain lay language. Keep all
+- Speak English with the owner, in plain lay language. Keep all
   repository docs, reports, prompts and code comments in en-US.
 - The main agent orchestrates, reviews and tests; implementation and research go
   to subagents (Haiku by default; escalate to Opus or do it directly when a task

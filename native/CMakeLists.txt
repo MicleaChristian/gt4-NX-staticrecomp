@@ -388,11 +388,29 @@ target_link_libraries(usb_dfp_fixture PRIVATE gt4_usb)
 target_compile_options(usb_dfp_fixture PRIVATE /W4)
 add_test(NAME native_usb_dfp COMMAND $<TARGET_FILE:usb_dfp_fixture>)
 target_link_libraries(ps2runtime_vulkan PUBLIC gt4_pacing gt4_quickfix gt4_install_paths gt4_vulkan_extensions gt4_usb)
+# TASK-174: portable host helpers (paths, clock). Windows backends here; Switch backends live under switch/.
+add_library(gt4_platform STATIC
+    platform/win32/paths_win32.cpp
+    platform/win32/clock_win32.cpp)
+target_compile_options(gt4_platform PRIVATE /W4)
+target_compile_definitions(gt4_platform PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(gt4_platform PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(gt4_platform PUBLIC winmm)
+add_executable(platform_fixture platform/platform_fixture.cpp)
+target_link_libraries(platform_fixture PRIVATE gt4_platform)
+target_compile_options(platform_fixture PRIVATE /W4)
+add_test(NAME native_platform COMMAND $<TARGET_FILE:platform_fixture>)
+# TASK-174: ISO discovery used by the Switch NRO (host compile of switch/source/iso_find.cpp).
+add_executable(switch_iso_fixture switch_iso_fixture.cpp "${CMAKE_SOURCE_DIR}/switch/source/iso_find.cpp")
+target_include_directories(switch_iso_fixture PRIVATE "${CMAKE_SOURCE_DIR}/switch/include")
+target_compile_options(switch_iso_fixture PRIVATE /W4 /EHsc)
+add_test(NAME native_switch_iso COMMAND $<TARGET_FILE:switch_iso_fixture>)
 # TASK-059 (slice200): installed-folder paths (<exe folder>\shaders, <exe folder>\gs\gt4-gs.exe) and --portable-check.
 add_library(gt4_install_paths STATIC install_paths.cpp)
 target_compile_options(gt4_install_paths PRIVATE /W4)
 target_compile_definitions(gt4_install_paths PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_include_directories(gt4_install_paths PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(gt4_install_paths PUBLIC gt4_platform)
 # TASK-025 Part A / TASK-058: atomic memory card writer, used by the memcard capsule's sio2.cpp.
 add_library(gt4_memcard STATIC memcard_store.cpp)
 target_compile_options(gt4_memcard PRIVATE /W4)
@@ -905,7 +923,7 @@ target_link_libraries(gt4_sdl3 INTERFACE "${GT4_SDL3_ROOT}/${GT4_SDL3_IMPORT_LIB
 add_library(gt4_pad_mapping STATIC pad_mapping.cpp pad_choice.cpp input_recording.cpp)
 target_compile_options(gt4_pad_mapping PRIVATE /W4)
 add_library(native_host_io STATIC host_io.cpp frame_clock.cpp controls.cpp wheel.cpp)
-target_link_libraries(native_host_io PUBLIC gt4_pad_mapping gt4_usb)
+target_link_libraries(native_host_io PUBLIC gt4_pad_mapping gt4_usb gt4_platform)
 if(GT4_PERF_RUNTIME_SOURCE)
     target_compile_definitions(native_host_io PRIVATE GT4_PERF_PROBE)
     target_link_libraries(native_host_io PUBLIC gt4_perf_probe)

@@ -77,10 +77,11 @@ Choose the channel in the launcher (Settings > General > Channel). Every piece o
 
 | Phase | Release | Platform | Renderer | Status |
 |---|---|---|---|---|
+| **Switch** | homebrew | Nintendo Switch 1 (Atmosphere `.nro`) | CoreGS + deko3d | **Primary objective of this checkout** (TASK-174) |
 | **1** | 1.0.0 - 1.2.5 | Windows PC | GSdx (PCSX2 GS, separate process) | Done |
-| **2** | 1.3.0 - 2.0.0 | Windows PC | **CoreGS 2.0** (our own) as the default · GSdx as the fallback | In progress (1.3.0 beta) |
-| **3** | after 2.0.0 | Linux (native) | CoreGS 2.0 | Planned |
-| **4** | after 2.0.0 | Android | CoreGS 2.0 (Vulkan) | Planned |
+| **2** | 1.3.0 - 2.0.0 | Windows PC | **CoreGS 2.0** (our own) as the default · GSdx as the fallback | Reference / tooling |
+| **3** | after Switch playable | Linux (native) | CoreGS 2.0 | Deferred here |
+| **4** | after Switch playable | Android | CoreGS 2.0 (Vulkan) | Deferred here |
 
 ## How it works
 
