@@ -158,17 +158,24 @@ void CpuRenderer::ResetGs(bool clearVram) {
     lastImage_.reset();
 }
 
-FrameImage CpuRenderer::EndFrame() {
+void CpuRenderer::FlushBatchesForDisplay() {
     frontEnd_.VBlank(&kEverything, 1);
     frontEnd_.FlushBatch(FlushReason::VBlank);
-    if (memory_sync_hook_) memory_sync_hook_(memory_.Local(), true);
+}
 
+void CpuRenderer::SyncForDisplay() {
+    if (memory_sync_hook_) memory_sync_hook_(memory_.Local(), true);
+}
+
+bool CpuRenderer::PeekDisplay(display::DisplayLayout &layout, display::PmodeFields &pmode) {
+    layout = display::compute_layout(displayRegs_, previousDby_);
+    pmode = display::decode_pmode(displayRegs_.pmode);
+    return layout.valid;
+}
+
+FrameImage CpuRenderer::ComposeDisplay(const display::DisplayLayout &layout, const display::PmodeFields &pmode) {
     FrameImage out;
-    const display::DisplayLayout layout = display::compute_layout(displayRegs_, previousDby_);
-    if (!layout.valid) {
-        return out;
-    }
-    const display::PmodeFields pmode = display::decode_pmode(displayRegs_.pmode);
+    if (!layout.valid) return out;
     std::array<display::Image, 2> sources{};
     std::array<bool, 2> available{false, false};
     for (size_t i = 0; i < 2; ++i) {
@@ -203,6 +210,15 @@ FrameImage CpuRenderer::EndFrame() {
     out.valid = size.width > 0 && size.height > 0;
     out.image = std::move(merged);
     return out;
+}
+
+FrameImage CpuRenderer::EndFrame() {
+    FlushBatchesForDisplay();
+    SyncForDisplay();
+    display::DisplayLayout layout{};
+    display::PmodeFields pmode{};
+    if (!PeekDisplay(layout, pmode)) return {};
+    return ComposeDisplay(layout, pmode);
 }
 
 void CpuRenderer::OnBatch(Batch&& batch) {

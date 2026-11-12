@@ -1033,12 +1033,12 @@ void WritebackDk::report(std::FILE *out) const {
   if (!out) return;
   std::fprintf(out,
                "[hw-dk] GPU batches=%llu (depth %llu, mip base level %llu) cpu_fallback=%llu seeds=%llu flushes=%llu "
-               "readback_MiB=%.1f upload_MiB=%.1f\n",
+               "gpu_scanouts=%llu readback_MiB=%.1f upload_MiB=%.1f\n",
                static_cast<unsigned long long>(stats_.batches), static_cast<unsigned long long>(stats_.depth_batches),
                static_cast<unsigned long long>(stats_.mip_base_level),
                static_cast<unsigned long long>(stats_.cpu_fallback), static_cast<unsigned long long>(stats_.seeds),
-               static_cast<unsigned long long>(stats_.flushes), stats_.readback_bytes / 1048576.0,
-               stats_.upload_bytes / 1048576.0);
+               static_cast<unsigned long long>(stats_.flushes), static_cast<unsigned long long>(stats_.gpu_scanouts),
+               stats_.readback_bytes / 1048576.0, stats_.upload_bytes / 1048576.0);
   std::fprintf(out, "[hw-dk] CPU fallback reasons:");
   for (int i = 0; i < static_cast<int>(Reject::Count); ++i) {
     if (stats_.rejects[i]) std::fprintf(out, " %s=%llu", kRejectNames[i], static_cast<unsigned long long>(stats_.rejects[i]));
@@ -1114,6 +1114,72 @@ bool WritebackDk::flush_to_slm(memory::LocalMemory &local, std::string &error, b
   if (!flush_surfaces(s, stats_, local, colour_only ? kColourBit : (kColourBit | kDepthBit), error)) return false;
   // Pixels just written back may be sampled as a texture later.
   if (had_dirty) invalidate_textures();
+  return true;
+#endif
+}
+
+bool WritebackDk::try_scanout(std::uint32_t fbp_pages, std::uint32_t fbw, std::uint32_t psm, std::int32_t dbx,
+                              std::int32_t dby, std::uint32_t read_w, std::uint32_t read_h, std::uint32_t display_w,
+                              std::uint32_t display_h, std::vector<std::uint32_t> &rgba, std::string &error) {
+#if !defined(__SWITCH__)
+  (void)fbp_pages;
+  (void)fbw;
+  (void)psm;
+  (void)dbx;
+  (void)dby;
+  (void)read_w;
+  (void)read_h;
+  (void)display_w;
+  (void)display_h;
+  (void)rgba;
+  error = "not switch";
+  return false;
+#else
+  if (!ready_ || !state_ || state_->gpu_error) return false;
+  if (read_w == 0 || read_h == 0 || display_w == 0 || display_h == 0) return false;
+  if (psm != hwgs::psm::kCt32 && psm != hwgs::psm::kCt24) return false;
+  // Present either matches the read rectangle or is a simple FFMD line-double of it.
+  const bool line_double = display_w == read_w && display_h == read_h * 2u;
+  if (!(display_w == read_w && display_h == read_h) && !line_double) return false;
+
+  State &s = *state_;
+  const auto decoded = memory::decodePsm(psm);
+  if (!decoded) return false;
+  const memory::BufferView view{memory::blockOfPage(fbp_pages), fbw, *decoded};
+  if (!s.colour.same_target(view)) return false;
+
+  const Rect need{dbx, dby, dbx + static_cast<int32_t>(read_w) - 1, dby + static_cast<int32_t>(read_h) - 1};
+  if (need.x0 < 0 || need.y0 < 0 || need.x1 >= kDkSurface || need.y1 >= kDkSurface) return false;
+  const Rect held = unite(s.colour.seeded, s.colour.dirty);
+  if (!held.contains(need)) return false;
+
+  const uint32_t rw = read_w, rh = read_h;
+  if (static_cast<std::uint64_t>(rw) * rh * 4u > kSurfaceBytes) return false;
+
+  s.begin_recording();
+  s.barrier();
+  DkImageView colour_view;
+  dkImageViewDefaults(&colour_view, &s.colour.image);
+  DkImageRect rect{static_cast<uint32_t>(need.x0), static_cast<uint32_t>(need.y0), 0, rw, rh, 1};
+  DkCopyBuf dst{dkMemBlockGetGpuAddr(s.stage_mem), 0, 0};
+  dkCmdBufCopyImageToBuffer(s.cmdbuf, &colour_view, &rect, &dst, 0);
+  s.submit_and_wait(stats_);
+  if (s.gpu_error) return false;
+
+  const auto *src = reinterpret_cast<const std::uint32_t *>(s.stage_cpu);
+  rgba.resize(static_cast<std::size_t>(display_w) * display_h);
+  if (line_double) {
+    for (uint32_t y = 0; y < rh; ++y) {
+      const std::uint32_t *row = src + static_cast<std::size_t>(y) * rw;
+      std::memcpy(rgba.data() + static_cast<std::size_t>(y * 2u) * display_w, row, rw * 4u);
+      std::memcpy(rgba.data() + static_cast<std::size_t>(y * 2u + 1u) * display_w, row, rw * 4u);
+    }
+  } else {
+    std::memcpy(rgba.data(), src, static_cast<std::size_t>(rw) * rh * 4u);
+  }
+  stats_.readback_bytes += static_cast<std::uint64_t>(rw) * rh * 4u;
+  ++stats_.gpu_scanouts;
+  (void)error;
   return true;
 #endif
 }

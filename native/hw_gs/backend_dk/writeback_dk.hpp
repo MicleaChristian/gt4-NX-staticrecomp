@@ -53,6 +53,7 @@ struct DkGpuStats {
   std::uint64_t seeds = 0;
   std::uint64_t depth_batches = 0;
   std::uint64_t mip_base_level = 0; // mipmapped batches drawn from the base level (approximation)
+  std::uint64_t gpu_scanouts = 0;   // display taken from the GPU colour target (no CPU compose)
   std::uint64_t rejects[static_cast<int>(Reject::Count)] = {};
 };
 
@@ -72,6 +73,13 @@ public:
 
   // Write dirty GPU pixels back into SLM: colour and depth, or colour only (display compose).
   bool flush_to_slm(memory::LocalMemory &local, std::string &error, bool colour_only = false);
+
+  // Display path: copy the GPU colour target into host RGBA8 when it matches DISPFB and already
+  // covers the read rectangle (seeded ∪ dirty). Line-doubles when display_h == 2 * read_h (FFMD).
+  // Leaves dirty pixels on the GPU (no SLM write). Returns false → caller uses CPU compose.
+  bool try_scanout(std::uint32_t fbp_pages, std::uint32_t fbw, std::uint32_t psm, std::int32_t dbx,
+                   std::int32_t dby, std::uint32_t read_w, std::uint32_t read_h, std::uint32_t display_w,
+                   std::uint32_t display_h, std::vector<std::uint32_t> &rgba, std::string &error);
 
   // A transfer is about to access [block, block + blocks). Writes GPU pixels back when the range
   // overlaps them, and forgets the GPU copies when the transfer writes over them.

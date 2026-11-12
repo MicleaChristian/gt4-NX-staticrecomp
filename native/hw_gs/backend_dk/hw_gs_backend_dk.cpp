@@ -7,6 +7,7 @@
 #include "cpuref_draw.hpp"
 #include "cpuref_renderer.hpp"
 #include "dk_gpu.hpp"
+#include "hw_gs_display.hpp"
 #include "perf_nx.hpp"
 #include "platform/nx/deko3d_present.hpp"
 #include "writeback_dk.hpp"
@@ -47,6 +48,7 @@ struct Backend::Impl {
   hwgs::cpuref::FrameImage last_frame{};
   ScanoutRequest last_scanout{}; // packed RGBA8 of last_frame, reused by present_slot
   std::uint64_t present_frames = 0;
+  std::uint64_t field_holds = 0; // interlaced FFMD: odd vblanks re-show the previous field
 
   void shutdown() {
     if (writeback.ready()) writeback.report(stderr);
@@ -233,9 +235,37 @@ bool Backend::scanout(ScanoutRequest &request) {
   request.height = 0;
   request.pixels.clear();
   if (!impl_->cpu) return false;
-  // EndFrame flushes the last batch, then the memory sync hook writes GPU pixels back before compose.
+
+  // Flush draws first. Prefer copying the GPU colour target straight to the present buffer
+  // (skips SLM write-back and the CPU circuit compose). Fall back to colour flush + CPU compose.
+  impl_->cpu->FlushBatchesForDisplay();
+  hwgs::display::DisplayLayout layout{};
+  hwgs::display::PmodeFields pmode{};
+  if (!impl_->cpu->PeekDisplay(layout, pmode)) return false;
+
+  if (impl_->writeback.ready()) {
+    const hwgs::display::MergePlan plan =
+        hwgs::display::plan_merge(pmode, layout.circuits[0], layout.circuits[1], true, false);
+    const hwgs::display::CircuitRect &c = layout.circuits[0];
+    const bool single = plan.use_rc1 && !plan.use_rc2 && c.enabled && c.read_width > 0 && c.read_height > 0;
+    if (single) {
+      gt4::perf::Scope compose(gt4::perf::kGsCompose);
+      std::string err;
+      if (impl_->writeback.try_scanout(c.fbp, c.fbw, c.psm, c.dbx, c.dby, c.read_width, c.read_height,
+                                       c.display_width, c.display_height, request.pixels, err)) {
+        request.width = c.display_width;
+        request.height = c.display_height;
+        impl_->last_frame.valid = true;
+        impl_->last_frame.image.width = request.width;
+        impl_->last_frame.image.height = request.height;
+        return true;
+      }
+    }
+  }
+
+  impl_->cpu->SyncForDisplay();
   gt4::perf::Scope compose(gt4::perf::kGsCompose);
-  hwgs::cpuref::FrameImage frame = impl_->cpu->EndFrame();
+  hwgs::cpuref::FrameImage frame = impl_->cpu->ComposeDisplay(layout, pmode);
   impl_->last_frame = frame;
   if (!frame.valid || frame.image.width == 0 || frame.image.height == 0) return false;
   request.width = frame.image.width;
@@ -268,6 +298,16 @@ void Backend::set_display_aspect(bool fill, std::uint32_t ratio_millionths) {
 }
 
 void Backend::present(PresentPhase phase) {
+  Impl &s = *impl_;
+  // Interlaced FFMD (menus): odd guest fields re-show the previous even field. Cuts compose cost
+  // in half and stops bob on a progressive panel; race path forces 480p separately.
+  const std::uint64_t smode2 = s.cpu ? s.cpu->DisplayRegs().smode2 : 0;
+  const bool ffmd = (smode2 & 3u) == 3u;
+  if (ffmd && (s.present_frames & 1u) != 0 && !s.last_scanout.pixels.empty()) {
+    ++s.field_holds;
+    present_slot();
+    return;
+  }
   if (end_frame(phase)) present_slot();
 }
 
@@ -275,7 +315,10 @@ bool Backend::end_frame(PresentPhase phase) {
   Impl &s = *impl_;
   s.stats.presents++;
   // Cumulative; repeated so a session ended with Plus still leaves the numbers in stderr.log.
-  if (s.writeback.ready() && s.stats.presents % 600 == 0) s.writeback.report(stderr);
+  if (s.writeback.ready() && s.stats.presents % 600 == 0) {
+    s.writeback.report(stderr);
+    std::fprintf(stderr, "[hw-dk] field_holds=%llu\n", static_cast<unsigned long long>(s.field_holds));
+  }
   if (s.cpu) s.cpu->SetDisplayField(phase == PresentPhase::field_odd);
   s.last_scanout.phase = phase;
   if (!scanout(s.last_scanout) || s.last_scanout.pixels.empty()) {
@@ -324,6 +367,7 @@ RenderCounters Backend::render_counters() const {
     out.gpu_cpu_fallback = wb.cpu_fallback;
     out.gpu_tex_cache_hits = wb.tex_cache_hits;
     out.gpu_flushes = wb.flushes;
+    out.gpu_composed_frames = wb.gpu_scanouts;
   }
   return out;
 }

@@ -100,6 +100,14 @@ public:
     // Ends a frame: flushes the batch, then composes the display image from the registers.
     FrameImage EndFrame();
 
+    // Split form of EndFrame for a GPU present path: flush batches (no memory sync), then either
+    // scan out from the GPU colour target or call SyncForDisplay + ComposeDisplay.
+    void FlushBatchesForDisplay();
+    void SyncForDisplay();
+    // Fills layout/pmode from the current registers. Returns false when the display is invalid.
+    bool PeekDisplay(display::DisplayLayout &layout, display::PmodeFields &pmode);
+    FrameImage ComposeDisplay(const display::DisplayLayout &layout, const display::PmodeFields &pmode);
+
     // Coherent SLM decode matching the MIT donor's gs::display at 1x (12.9, 14.2).
     // Does not merge, deinterlace, apply anti-blur, or alter display/history state.
     VramDisplayDump DumpVramDisplay();
