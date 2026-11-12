@@ -7,8 +7,6 @@
 #if defined(__SWITCH__)
 #include <switch.h>
 #include <deko3d.h>
-
-#include "perf_nx.hpp"
 #endif
 
 namespace gt4::platform::nx {
@@ -18,11 +16,8 @@ bool g_alive = false;
 
 #if defined(__SWITCH__)
 constexpr int kFbNum = 2;
-constexpr int kStageSlots = 2;
-constexpr int kFbW = 1280;
-constexpr int kFbH = 720;
-constexpr int kGuestMaxW = 1024;
-constexpr int kGuestMaxH = 1024;
+constexpr int kFbW = 640;
+constexpr int kFbH = 448;
 
 bool g_fb_libnx = false;
 Framebuffer g_libnx_fb{};
@@ -35,37 +30,31 @@ DkSwapchain g_swapchain = nullptr;
 DkMemBlock g_cmd_mem = nullptr;
 DkCmdBuf g_cmdbuf = nullptr;
 DkQueue g_queue = nullptr;
-
-// Double-buffered guest staging (tight RGBA8). CPU writes slot N only after its fence.
 DkMemBlock g_stage_mem = nullptr;
-std::uint32_t *g_stage_cpu[kStageSlots] = {};
-DkFence g_stage_fence[kStageSlots]{};
-bool g_stage_fence_live[kStageSlots] = {};
-int g_stage_write = 0;
-uint32_t g_stage_slot_bytes = 0;
+DkImage g_stage_image{};
+uint32_t g_stage_pitch = 0; // bytes per row
+std::uint8_t *g_stage_cpu = nullptr;
 
-// Pitch-linear guest image the 2D engine blits from (GPU scale / letterbox).
-DkMemBlock g_guest_mem = nullptr;
-DkImage g_guest_image{};
-DkImageLayout g_guest_layout{};
-uint32_t g_guest_pitch = 0;
-int g_guest_w = 0;
-int g_guest_h = 0;
-
-int g_last_present_w = 0;
-int g_last_present_h = 0;
-bool g_have_last_present = false;
-
-int fb_width() { return g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW; }
-int fb_height() { return g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH; }
-
-void letterbox_rects(int src_w, int src_h, int dst_w, int dst_h, int &ox, int &oy, int &dw, int &dh) {
-  const float scale = std::min(static_cast<float>(dst_w) / static_cast<float>(src_w),
-                               static_cast<float>(dst_h) / static_cast<float>(src_h));
-  dw = std::max(1, static_cast<int>(static_cast<float>(src_w) * scale));
-  dh = std::max(1, static_cast<int>(static_cast<float>(src_h) * scale));
-  ox = (dst_w - dw) / 2;
-  oy = (dst_h - dh) / 2;
+void draw_osd_rgba(std::uint32_t *dst, int dst_w, int dst_h, int pitch_px, std::uint64_t frame) {
+  const int bar_h = 28;
+  const int bar_y = dst_h - bar_h - 40;
+  const std::uint64_t span = 300;
+  const int bar_w = static_cast<int>((std::min(frame, span) * static_cast<std::uint64_t>(dst_w)) / span);
+  const std::uint32_t cyan = RGBA8_MAXALPHA(0, 200, 255);
+  const std::uint32_t dark = RGBA8_MAXALPHA(0, 40, 60);
+  for (int y = 0; y < bar_h; ++y) {
+    std::uint32_t *row = dst + (bar_y + y) * pitch_px;
+    for (int x = 0; x < dst_w; ++x) row[x] = (x < bar_w) ? cyan : dark;
+  }
+  const int ticks = static_cast<int>(std::min<std::uint64_t>(frame / 60u, static_cast<std::uint64_t>(dst_w / 8)));
+  for (int t = 0; t < ticks; ++t) {
+    const int x0 = 8 + t * 8;
+    for (int y = 8; y < 20; ++y) {
+      std::uint32_t *row = dst + y * pitch_px;
+      row[x0] = RGBA8_MAXALPHA(255, 255, 255);
+      row[x0 + 1] = RGBA8_MAXALPHA(255, 255, 255);
+    }
+  }
 }
 
 void destroy_libnx_fb() {
@@ -76,13 +65,12 @@ void destroy_libnx_fb() {
 }
 
 void destroy_deko() {
-  if (!g_dk && !g_device) return;
+  if (!g_dk) return;
   if (g_queue) dkQueueWaitIdle(g_queue);
   if (g_queue) dkQueueDestroy(g_queue);
   if (g_cmdbuf) dkCmdBufDestroy(g_cmdbuf);
   if (g_cmd_mem) dkMemBlockDestroy(g_cmd_mem);
   if (g_stage_mem) dkMemBlockDestroy(g_stage_mem);
-  if (g_guest_mem) dkMemBlockDestroy(g_guest_mem);
   if (g_swapchain) dkSwapchainDestroy(g_swapchain);
   if (g_fb_mem) dkMemBlockDestroy(g_fb_mem);
   if (g_device) dkDeviceDestroy(g_device);
@@ -90,24 +78,18 @@ void destroy_deko() {
   g_cmdbuf = nullptr;
   g_cmd_mem = nullptr;
   g_stage_mem = nullptr;
-  g_guest_mem = nullptr;
-  for (int i = 0; i < kStageSlots; ++i) {
-    g_stage_cpu[i] = nullptr;
-    g_stage_fence_live[i] = false;
-  }
+  g_stage_cpu = nullptr;
   g_swapchain = nullptr;
   g_fb_mem = nullptr;
   g_device = nullptr;
-  g_guest_w = g_guest_h = 0;
-  g_have_last_present = false;
   g_dk = false;
 }
 
 bool begin_libnx_fb() {
   destroy_libnx_fb();
   std::memset(&g_libnx_fb, 0, sizeof(g_libnx_fb));
-  const u32 w = static_cast<u32>(fb_width());
-  const u32 h = static_cast<u32>(fb_height());
+  const u32 w = static_cast<u32>(g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW);
+  const u32 h = static_cast<u32>(g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH);
   if (R_FAILED(framebufferCreate(&g_libnx_fb, nwindowGetDefault(), w, h, PIXEL_FORMAT_RGBA_8888, 2))) return false;
   if (R_FAILED(framebufferMakeLinear(&g_libnx_fb))) {
     framebufferClose(&g_libnx_fb);
@@ -117,37 +99,16 @@ bool begin_libnx_fb() {
   return true;
 }
 
-bool ensure_guest_image(int width, int height) {
-  if (width <= 0 || height <= 0 || width > kGuestMaxW || height > kGuestMaxH) return false;
-  if (g_guest_mem && g_guest_w == width && g_guest_h == height) return true;
-
-  // Layout/image can be re-initialised over the same max-sized mem block.
-  if (!g_guest_mem) return false;
-  g_guest_pitch = (static_cast<uint32_t>(width) * 4u + (DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1)) &
-                  ~(DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1);
-  DkImageLayoutMaker layoutMaker;
-  dkImageLayoutMakerDefaults(&layoutMaker, g_device);
-  layoutMaker.flags = DkImageFlags_PitchLinear | DkImageFlags_Usage2DEngine;
-  layoutMaker.format = DkImageFormat_RGBA8_Unorm;
-  layoutMaker.dimensions[0] = static_cast<uint32_t>(width);
-  layoutMaker.dimensions[1] = static_cast<uint32_t>(height);
-  layoutMaker.pitchStride = g_guest_pitch;
-  dkImageLayoutInitialize(&g_guest_layout, &layoutMaker);
-  dkImageInitialize(&g_guest_image, &g_guest_layout, g_guest_mem, 0);
-  g_guest_w = width;
-  g_guest_h = height;
-  return true;
-}
-
 bool begin_deko() {
   destroy_deko();
-  const int fb_w = fb_width();
-  const int fb_h = fb_height();
 
   DkDeviceMaker deviceMaker;
   dkDeviceMakerDefaults(&deviceMaker);
   g_device = dkDeviceCreate(&deviceMaker);
   if (!g_device) return false;
+
+  const int fb_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
+  const int fb_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
 
   DkImageLayoutMaker layoutMaker;
   dkImageLayoutMakerDefaults(&layoutMaker, g_device);
@@ -156,10 +117,11 @@ bool begin_deko() {
   layoutMaker.format = DkImageFormat_RGBA8_Unorm;
   layoutMaker.dimensions[0] = static_cast<uint32_t>(fb_w);
   layoutMaker.dimensions[1] = static_cast<uint32_t>(fb_h);
+
   DkImageLayout fbLayout;
   dkImageLayoutInitialize(&fbLayout, &layoutMaker);
   uint32_t fbSize = static_cast<uint32_t>(dkImageLayoutGetSize(&fbLayout));
-  const uint32_t fbAlign = dkImageLayoutGetAlignment(&fbLayout);
+  uint32_t fbAlign = dkImageLayoutGetAlignment(&fbLayout);
   fbSize = (fbSize + fbAlign - 1) & ~(fbAlign - 1);
 
   DkMemBlockMaker memMaker;
@@ -170,11 +132,13 @@ bool begin_deko() {
     destroy_deko();
     return false;
   }
+
   DkImage const *swapchainImages[kFbNum];
   for (int i = 0; i < kFbNum; ++i) {
     swapchainImages[i] = &g_framebuffers[i];
     dkImageInitialize(&g_framebuffers[i], &fbLayout, g_fb_mem, static_cast<uint32_t>(i) * fbSize);
   }
+
   DkSwapchainMaker swapMaker;
   dkSwapchainMakerDefaults(&swapMaker, g_device, nwindowGetDefault(), swapchainImages, kFbNum);
   g_swapchain = dkSwapchainCreate(&swapMaker);
@@ -183,53 +147,43 @@ bool begin_deko() {
     return false;
   }
 
-  g_stage_slot_bytes = static_cast<uint32_t>(kGuestMaxW) * static_cast<uint32_t>(kGuestMaxH) * 4u;
-  const uint32_t stage_total = ((g_stage_slot_bytes * kStageSlots) + 0xFFFu) & ~0xFFFu;
-  dkMemBlockMakerDefaults(&memMaker, g_device, stage_total);
-  memMaker.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
+  // Pitch-linear staging image the CPU writes every frame; GPU blits to the swapchain.
+  g_stage_pitch = (static_cast<uint32_t>(fb_w) * 4u + (DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1)) &
+                  ~(DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1);
+  dkImageLayoutMakerDefaults(&layoutMaker, g_device);
+  layoutMaker.flags = DkImageFlags_PitchLinear | DkImageFlags_Usage2DEngine;
+  layoutMaker.format = DkImageFormat_RGBA8_Unorm;
+  layoutMaker.dimensions[0] = static_cast<uint32_t>(fb_w);
+  layoutMaker.dimensions[1] = static_cast<uint32_t>(fb_h);
+  layoutMaker.pitchStride = g_stage_pitch;
+
+  DkImageLayout stageLayout;
+  dkImageLayoutInitialize(&stageLayout, &layoutMaker);
+  const uint32_t stageSize = static_cast<uint32_t>(dkImageLayoutGetSize(&stageLayout));
+  const uint32_t stageAlign = dkImageLayoutGetAlignment(&stageLayout);
+
+  dkMemBlockMakerDefaults(&memMaker, g_device, (stageSize + stageAlign - 1) & ~(stageAlign - 1));
+  memMaker.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
   g_stage_mem = dkMemBlockCreate(&memMaker);
   if (!g_stage_mem) {
     destroy_deko();
     return false;
   }
-  auto *base = static_cast<std::uint8_t *>(dkMemBlockGetCpuAddr(g_stage_mem));
-  for (int i = 0; i < kStageSlots; ++i) {
-    g_stage_cpu[i] = reinterpret_cast<std::uint32_t *>(base + static_cast<std::size_t>(i) * g_stage_slot_bytes);
-    std::memset(g_stage_cpu[i], 0, g_stage_slot_bytes);
-    g_stage_fence_live[i] = false;
-  }
-  g_stage_write = 0;
-
-  // Max-sized pitch-linear guest target for GPU blit.
-  const uint32_t guest_pitch =
-      (static_cast<uint32_t>(kGuestMaxW) * 4u + (DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1)) &
-      ~(DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1);
-  dkImageLayoutMakerDefaults(&layoutMaker, g_device);
-  layoutMaker.flags = DkImageFlags_PitchLinear | DkImageFlags_Usage2DEngine;
-  layoutMaker.format = DkImageFormat_RGBA8_Unorm;
-  layoutMaker.dimensions[0] = kGuestMaxW;
-  layoutMaker.dimensions[1] = kGuestMaxH;
-  layoutMaker.pitchStride = guest_pitch;
-  DkImageLayout maxGuestLayout;
-  dkImageLayoutInitialize(&maxGuestLayout, &layoutMaker);
-  uint32_t guest_bytes = static_cast<uint32_t>(dkImageLayoutGetSize(&maxGuestLayout));
-  const uint32_t guest_align = dkImageLayoutGetAlignment(&maxGuestLayout);
-  guest_bytes = (guest_bytes + guest_align - 1) & ~(guest_align - 1);
-  dkMemBlockMakerDefaults(&memMaker, g_device, guest_bytes);
-  memMaker.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
-  g_guest_mem = dkMemBlockCreate(&memMaker);
-  if (!g_guest_mem) {
+  dkImageInitialize(&g_stage_image, &stageLayout, g_stage_mem, 0);
+  g_stage_cpu = static_cast<std::uint8_t *>(dkMemBlockGetCpuAddr(g_stage_mem));
+  if (!g_stage_cpu) {
     destroy_deko();
     return false;
   }
 
-  dkMemBlockMakerDefaults(&memMaker, g_device, 256 * 1024);
+  dkMemBlockMakerDefaults(&memMaker, g_device, 64 * 1024);
   memMaker.flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached;
   g_cmd_mem = dkMemBlockCreate(&memMaker);
   if (!g_cmd_mem) {
     destroy_deko();
     return false;
   }
+
   DkCmdBufMaker cmdMaker;
   dkCmdBufMakerDefaults(&cmdMaker, g_device);
   g_cmdbuf = dkCmdBufCreate(&cmdMaker);
@@ -237,7 +191,7 @@ bool begin_deko() {
     destroy_deko();
     return false;
   }
-  dkCmdBufAddMemory(g_cmdbuf, g_cmd_mem, 0, 256 * 1024);
+  dkCmdBufAddMemory(g_cmdbuf, g_cmd_mem, 0, 64 * 1024);
 
   DkQueueMaker queueMaker;
   dkQueueMakerDefaults(&queueMaker, g_device);
@@ -247,92 +201,110 @@ bool begin_deko() {
     destroy_deko();
     return false;
   }
+
   g_dk = true;
   return true;
 }
 
-bool present_gpu_scaled(const std::uint32_t *src, int width, int height) {
-  if (!g_dk || !g_stage_cpu[0]) return false;
-  if (width > kGuestMaxW || height > kGuestMaxH) return false;
-  if (!ensure_guest_image(width, height)) return false;
+bool present_staging(std::uint64_t frame_osd) {
+  if (!g_dk || !g_stage_cpu) return false;
 
-  const int slot = g_stage_write;
-  if (g_stage_fence_live[slot]) {
-    dkFenceWait(&g_stage_fence[slot], -1);
-    g_stage_fence_live[slot] = false;
-  }
+  const int fb_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
+  const int fb_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
+  const int pitch_px = static_cast<int>(g_stage_pitch / 4u);
+  draw_osd_rgba(reinterpret_cast<std::uint32_t *>(g_stage_cpu), fb_w, fb_h, pitch_px, frame_osd);
 
-  // Tight packed guest → staging slot (no 720p letterbox on CPU).
-  const std::size_t guest_bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
-  std::memcpy(g_stage_cpu[slot], src, guest_bytes);
-
-  const int fb_w = fb_width();
-  const int fb_h = fb_height();
-  int ox = 0, oy = 0, dw = fb_w, dh = fb_h;
-  letterbox_rects(width, height, fb_w, fb_h, ox, oy, dw, dh);
-
-  const int swap = dkQueueAcquireImage(g_queue, g_swapchain);
+  const int slot = dkQueueAcquireImage(g_queue, g_swapchain);
   dkCmdBufClear(g_cmdbuf);
 
-  // Clear swapchain to black, then blit guest into the letterboxed rect.
+  DkImageView srcView;
+  dkImageViewDefaults(&srcView, &g_stage_image);
   DkImageView dstView;
-  dkImageViewDefaults(&dstView, &g_framebuffers[swap]);
-  dkCmdBufBindRenderTarget(g_cmdbuf, &dstView, nullptr);
-  DkViewport vp{0, 0, static_cast<float>(fb_w), static_cast<float>(fb_h), 0, 1};
-  DkScissor sc{0, 0, static_cast<uint32_t>(fb_w), static_cast<uint32_t>(fb_h)};
-  dkCmdBufSetViewports(g_cmdbuf, 0, &vp, 1);
-  dkCmdBufSetScissors(g_cmdbuf, 0, &sc, 1);
-  dkCmdBufClearColorFloat(g_cmdbuf, 0, DkColorMask_RGBA, 0.f, 0.f, 0.f, 1.f);
+  dkImageViewDefaults(&dstView, &g_framebuffers[slot]);
 
-  const DkCopyBuf linearSrc{dkMemBlockGetGpuAddr(g_stage_mem) +
-                                static_cast<DkGpuAddr>(slot) * g_stage_slot_bytes,
-                            0, 0};
-  DkImageView guestView;
-  dkImageViewDefaults(&guestView, &g_guest_image);
-  const DkImageRect guestRect{0, 0, 0, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
-  dkCmdBufCopyBufferToImage(g_cmdbuf, &linearSrc, &guestView, &guestRect, 0);
+  DkImageRect srcRect{0, 0, 0, static_cast<uint32_t>(fb_w), static_cast<uint32_t>(fb_h), 1};
+  DkImageRect dstRect{0, 0, 0, static_cast<uint32_t>(fb_w), static_cast<uint32_t>(fb_h), 1};
+  dkCmdBufBlitImage(g_cmdbuf, &srcView, &srcRect, &dstView, &dstRect, DkBlitFlag_FilterNearest, 0);
 
-  const DkImageRect srcRect{0, 0, 0, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
-  const DkImageRect dstRect{static_cast<uint32_t>(ox), static_cast<uint32_t>(oy), 0, static_cast<uint32_t>(dw),
-                            static_cast<uint32_t>(dh), 1};
-  dkCmdBufBlitImage(g_cmdbuf, &guestView, &srcRect, &dstView, &dstRect, DkBlitFlag_FilterLinear, 0);
-
-  dkCmdBufSignalFence(g_cmdbuf, &g_stage_fence[slot], true);
   DkCmdList list = dkCmdBufFinishList(g_cmdbuf);
   dkQueueSubmitCommands(g_queue, list);
-  dkQueuePresentImage(g_queue, g_swapchain, swap);
-  g_stage_fence_live[slot] = true;
-  g_stage_write = (slot + 1) % kStageSlots;
-  g_last_present_w = width;
-  g_last_present_h = height;
-  g_have_last_present = true;
+  dkQueuePresentImage(g_queue, g_swapchain, slot);
   return true;
 }
 
-bool present_libnx_rgba(const std::uint8_t *rgba, int width, int height) {
+bool present_libnx_rgba(const std::uint8_t *rgba, int width, int height, std::uint64_t frame_osd) {
   if (!g_fb_libnx || !rgba) return false;
   u32 stride = 0;
   auto *dst = static_cast<std::uint32_t *>(framebufferBegin(&g_libnx_fb, &stride));
   if (!dst) return false;
-  const int dst_w = fb_width();
-  const int dst_h = fb_height();
-  int ox = 0, oy = 0, dw = 0, dh = 0;
-  letterbox_rects(width, height, dst_w, dst_h, ox, oy, dw, dh);
+  const int dst_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
+  const int dst_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
   const int pitch_px = static_cast<int>(stride / 4u);
-  for (int y = 0; y < dst_h; ++y) {
-    std::memset(dst + static_cast<std::size_t>(y) * pitch_px, 0, static_cast<std::size_t>(dst_w) * 4u);
-  }
   const auto *src = reinterpret_cast<const std::uint32_t *>(rgba);
+
+  // Exact fit: one memcpy per row (FMV / 480i menus when FB matches the guest).
+  if (width == dst_w && height == dst_h && static_cast<int>(stride) == dst_w * 4) {
+    std::memcpy(dst, src, static_cast<std::size_t>(dst_w) * static_cast<std::size_t>(dst_h) * 4u);
+  } else if (width == dst_w && height == dst_h) {
+    for (int y = 0; y < dst_h; ++y) {
+      std::memcpy(reinterpret_cast<std::uint8_t *>(dst) + static_cast<std::size_t>(y) * stride,
+                  src + static_cast<std::size_t>(y) * static_cast<std::size_t>(width),
+                  static_cast<std::size_t>(width) * 4u);
+    }
+  } else {
+    // Letterbox once per size change; reuse black bars.
+    static int cleared_w = -1, cleared_h = -1;
+    if (cleared_w != dst_w || cleared_h != dst_h) {
+      for (int y = 0; y < dst_h; ++y) {
+        std::memset(reinterpret_cast<std::uint8_t *>(dst) + static_cast<std::size_t>(y) * stride, 0,
+                    static_cast<std::size_t>(dst_w) * 4u);
+      }
+      cleared_w = dst_w;
+      cleared_h = dst_h;
+    }
+    const int dw = std::min(dst_w, width);
+    const int dh = std::min(dst_h, height);
+    const int ox = (dst_w - dw) / 2;
+    const int oy = (dst_h - dh) / 2;
+    // Center-crop or 1:1 copy of the overlapping window — no per-pixel upscale on the CPU.
+    const int src_x0 = (width - dw) / 2;
+    const int src_y0 = (height - dh) / 2;
+    for (int y = 0; y < dh; ++y) {
+      auto *row = reinterpret_cast<std::uint32_t *>(reinterpret_cast<std::uint8_t *>(dst) +
+                                                    static_cast<std::size_t>(oy + y) * stride) +
+                  ox;
+      std::memcpy(row, src + static_cast<std::size_t>(src_y0 + y) * static_cast<std::size_t>(width) +
+                           static_cast<std::size_t>(src_x0),
+                  static_cast<std::size_t>(dw) * 4u);
+    }
+  }
+  draw_osd_rgba(dst, dst_w, dst_h, pitch_px, frame_osd);
+  framebufferEnd(&g_libnx_fb);
+  return true;
+}
+
+void blit_guest_into_stage(const std::uint32_t *src, int width, int height) {
+  const int fb_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
+  const int fb_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
+  const int pitch_px = static_cast<int>(g_stage_pitch / 4u);
+  auto *dst = reinterpret_cast<std::uint32_t *>(g_stage_cpu);
+  for (int y = 0; y < fb_h; ++y) {
+    std::memset(dst + y * pitch_px, 0, static_cast<std::size_t>(fb_w) * 4u);
+  }
+  const float scale = std::min(static_cast<float>(fb_w) / static_cast<float>(width),
+                               static_cast<float>(fb_h) / static_cast<float>(height));
+  const int dw = std::max(1, static_cast<int>(static_cast<float>(width) * scale));
+  const int dh = std::max(1, static_cast<int>(static_cast<float>(height) * scale));
+  const int ox = (fb_w - dw) / 2;
+  const int oy = (fb_h - dh) / 2;
   for (int y = 0; y < dh; ++y) {
     const int sy = y * height / dh;
-    auto *row = dst + static_cast<std::size_t>(oy + y) * pitch_px + ox;
+    std::uint32_t *row = dst + (oy + y) * pitch_px + ox;
     for (int x = 0; x < dw; ++x) {
       const int sx = x * width / dw;
       row[x] = src[static_cast<std::size_t>(sy) * static_cast<std::size_t>(width) + static_cast<std::size_t>(sx)];
     }
   }
-  framebufferEnd(&g_libnx_fb);
-  return true;
 }
 #endif
 
@@ -351,11 +323,13 @@ void deko3d_present_destroy() {
 
 bool soft_present_begin() {
 #if defined(__SWITCH__)
-  if (begin_deko()) {
+  // Prefer the proven libnx linear FB. The first deko3d blit path scrambled guest RGBA
+  // (pitch/format); keep begin_deko() for the next CoreGS GPU present attempt only.
+  if (begin_libnx_fb()) {
     g_alive = true;
     return true;
   }
-  if (begin_libnx_fb()) {
+  if (begin_deko()) {
     g_alive = true;
     return true;
   }
@@ -374,39 +348,43 @@ void soft_present_end() {
 
 bool deko3d_present_frame(const std::uint8_t *rgba, std::size_t bytes, int width, int height,
                           std::uint64_t frame_osd) {
-  (void)frame_osd;
   if (!rgba || width <= 0 || height <= 0) return false;
   const std::size_t need = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u;
   if (bytes < need) return false;
 #if defined(__SWITCH__)
-  gt4::perf::note_present_size(width, height);
-  gt4::perf::Scope scope(gt4::perf::kPresent);
   g_alive = true;
   if (g_dk) {
-    return present_gpu_scaled(reinterpret_cast<const std::uint32_t *>(rgba), width, height);
+    blit_guest_into_stage(reinterpret_cast<const std::uint32_t *>(rgba), width, height);
+    return present_staging(frame_osd);
   }
-  if (g_fb_libnx) return present_libnx_rgba(rgba, width, height);
+  if (g_fb_libnx) return present_libnx_rgba(rgba, width, height, frame_osd);
   return false;
 #else
+  (void)frame_osd;
   (void)g_config;
   return true;
 #endif
 }
 
 bool soft_present_heartbeat(std::uint64_t frame) {
-  (void)frame;
 #if defined(__SWITCH__)
-  // Re-present last guest size as black only when we have never shown a frame.
-  if (g_have_last_present && g_dk) {
-    static std::vector<std::uint32_t> black;
-    const int w = std::max(1, g_last_present_w);
-    const int h = std::max(1, g_last_present_h);
-    black.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h), 0u);
-    return deko3d_present_frame(reinterpret_cast<const std::uint8_t *>(black.data()), black.size() * 4u, w, h, 0);
+  if (g_dk) {
+    const int fb_w = g_config.framebuffer_width > 0 ? g_config.framebuffer_width : kFbW;
+    const int fb_h = g_config.framebuffer_height > 0 ? g_config.framebuffer_height : kFbH;
+    const int pitch_px = static_cast<int>(g_stage_pitch / 4u);
+    auto *dst = reinterpret_cast<std::uint32_t *>(g_stage_cpu);
+    for (int y = 0; y < fb_h; ++y) std::memset(dst + y * pitch_px, 0, static_cast<std::size_t>(fb_w) * 4u);
+    return present_staging(frame);
   }
-  static const std::uint32_t kBlack[16 * 16] = {};
-  return deko3d_present_frame(reinterpret_cast<const std::uint8_t *>(kBlack), sizeof kBlack, 16, 16, 0);
+  if (g_fb_libnx) {
+    // Black frame + OSD through the libnx path.
+    static std::vector<std::uint32_t> black;
+    black.assign(16 * 16, 0u);
+    return present_libnx_rgba(reinterpret_cast<const std::uint8_t *>(black.data()), 16, 16, frame);
+  }
+  return false;
 #else
+  (void)frame;
   return false;
 #endif
 }

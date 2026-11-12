@@ -66,8 +66,8 @@ public:
   void shutdown();
   bool ready() const { return ready_; }
 
-  // Rasterise one CoreGS batch on the GPU. Returns false when the batch must be drawn by the CPU;
-  // the caller then calls flush_to_slm, draws, and calls note_cpu_fallback.
+  // Rasterise one CoreGS batch on the GPU. Approximate features beat a CPU fallback on Switch.
+  // Returns false only when the batch is skipped (GPU dead / unusable); callers must not soft-draw.
   bool draw_batch(const hwgs::Batch &batch, memory::LocalMemory &local, const clut::ClutUnit &clut,
                   std::string &error);
 
@@ -85,7 +85,7 @@ public:
   // overlaps them, and forgets the GPU copies when the transfer writes over them.
   void before_memory_access(memory::LocalMemory &local, std::uint32_t block, std::uint32_t blocks, bool write);
 
-  // After a CPU DrawBatch fallback: SLM changed, the GPU copies and decoded textures are stale.
+  // Count a batch that was not drawn on the GPU (no soft fallback).
   void note_cpu_fallback();
 
   void invalidate_textures();

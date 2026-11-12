@@ -87,31 +87,19 @@ bool Backend::init(const Options &options, std::string &error) {
   if (s.writeback.ready()) {
     hwgs::dk::WritebackDk *wb = &s.writeback;
     hwgs::cpuref::CpuRenderer *cpu = s.cpu.get();
+    // GPU-only: never call the CPU pixel drawer. A rejected/failed GPU batch is dropped (counted).
+    // Soft raster on the Switch ARM cores is what made car select ~0.3 FPS.
     s.cpu->SetBatchOverride(
         [wb](const hwgs::Batch &batch, hwgs::memory::LocalMemory &local, const hwgs::clut::ClutUnit &clut,
              hwgs::cpuref::DrawStats &draw_stats) -> bool {
           std::string err;
-          bool drawn = false;
-          {
-            gt4::perf::Scope gpu_draw(gt4::perf::kGsGpuDraw);
-            drawn = wb->draw_batch(batch, local, clut, err);
-          }
-          if (drawn) {
+          gt4::perf::Scope gpu_draw(gt4::perf::kGsGpuDraw);
+          if (wb->draw_batch(batch, local, clut, err)) {
             draw_stats.batches++;
             draw_stats.primitives += batch.prims.size();
-            return true;
+          } else {
+            wb->note_cpu_fallback(); // name kept: counts batches we refused to soft-draw
           }
-          // The CPU drawer reads and writes SLM: GPU pixels go back first, and the GPU copy is
-          // stale afterwards. Drawn here rather than by CpuRenderer so the fallback has its own perf slot.
-          {
-            gt4::perf::Scope flush(gt4::perf::kGsFlush);
-            wb->flush_to_slm(local, err);
-          }
-          {
-            gt4::perf::Scope cpu_draw(gt4::perf::kGsCpuDraw);
-            hwgs::cpuref::DrawBatch(batch, local, clut, draw_stats);
-          }
-          wb->note_cpu_fallback();
           return true;
         });
     s.cpu->SetMemorySyncHook([wb](hwgs::memory::LocalMemory &local, bool display_only) {

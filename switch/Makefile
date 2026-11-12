@@ -60,8 +60,8 @@ export INCLUDE
 
 # Resolve EE generated dir to an absolute path and keep it quoted (repo path has spaces).
 ifneq ($(strip $(SWITCH_EE_GENERATED)),)
-SWITCH_EE_GENERATED_ABS := $(abspath $(SWITCH_EE_GENERATED))
-INCLUDE += -I"$(CURDIR)/../private/references/ps2-web-recomp/runtime/include" -I"$(SWITCH_EE_GENERATED_ABS)"
+# Keep relative: abspath through the junction becomes a space-split make token.
+INCLUDE += -I"$(CURDIR)/../private/references/ps2-web-recomp/runtime/include" -I"$(SWITCH_EE_GENERATED)"
 endif
 
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE

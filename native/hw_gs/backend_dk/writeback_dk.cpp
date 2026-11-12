@@ -220,55 +220,18 @@ bool reject(DkGpuStats &stats, Reject why) {
   return false;
 }
 
-// Decision on whether the GPU path reproduces this batch. Reads only the batch.
-bool accept_batch(const hwgs::Batch &batch, bool depth_available, DkGpuStats &stats) {
-  const uint64_t prim = batch.state.effectivePrim;
+// Soft gates only: count approximations, but still draw. Hard reject only when the frame PSM
+// cannot be a colour target (Z formats as FRAME). Switch cannot afford a CPU DrawBatch fallback.
+bool accept_batch(const hwgs::Batch &batch, bool /*depth_available*/, DkGpuStats &stats) {
   const auto &ctx = batch.state.ctx;
-  const auto &env = batch.state.env;
-  const bool tme = bit(prim, hwgs::primbit::kTme);
-  const bool abe = bit(prim, hwgs::primbit::kAbe);
-
-  if (bit(prim, hwgs::primbit::kAa1)) return reject(stats, Reject::Other);
-  if ((env.colclamp & 1u) == 0) return reject(stats, Reject::ColClamp);
-
   const uint32_t frame_psm = hwgs::frame::Psm(ctx.frame);
-  if (frame_psm != hwgs::psm::kCt32 && frame_psm != hwgs::psm::kCt24) return reject(stats, Reject::FramePsm);
-  if (hwgs::frame::Fbmsk(ctx.frame) != 0) return reject(stats, Reject::FrameMask);
-
-  const DepthUse depth = depth_use(ctx);
-  if (depth.any() && !depth.never) {
-    if (!depth_available) return reject(stats, Reject::DepthUnavailable);
-    if (!z_format_known(z_psm_code(ctx.zbuf))) return reject(stats, Reject::ZFormat);
+  if (frame_psm != hwgs::psm::kCt32 && frame_psm != hwgs::psm::kCt24) {
+    return reject(stats, Reject::FramePsm);
   }
-  const AlphaPlan ap = alpha_plan(ctx, depth.write);
-  if (ap.second_pass && abe) return reject(stats, Reject::AlphaFailBlend);
-  if (hwgs::test::Date(ctx.test)) return reject(stats, Reject::DestAlphaTest);
-  if (abe) {
-    GpuBlend gb;
-    if ((env.pabe & 1u) || !map_blend(ctx.alpha, gb)) return reject(stats, Reject::Blend);
-  }
-
-  bool lines = false, others = false;
-  for (const auto &p : batch.prims) {
-    if (p.type == hwgs::PrimType::Line || p.type == hwgs::PrimType::LineStrip) lines = true;
-    else others = true;
-  }
-  if (lines && others) return reject(stats, Reject::PrimMix);
-
-  if (tme) {
-    const uint64_t tex0 = ctx.tex0;
-    const uint32_t psm = hwgs::tex0::Psm(tex0);
-    const bool known_psm = psm == hwgs::psm::kCt32 || psm == hwgs::psm::kCt24 || psm == hwgs::psm::kCt16 ||
-                           psm == hwgs::psm::kCt16S || hwgs::IsIndexedPsm(psm);
-    if (!known_psm || !memory::decodePsm(psm)) return reject(stats, Reject::Texture);
-    if (hwgs::tex0::Tw(tex0) > 9u || hwgs::tex0::Th(tex0) > 9u) return reject(stats, Reject::Texture);
-    if (!bit(prim, hwgs::primbit::kFst)) {
-      for (const auto &v : batch.vertices) {
-        if (!(v.q > 0.0f) || !std::isfinite(v.q) || !std::isfinite(v.s) || !std::isfinite(v.t))
-          return reject(stats, Reject::Other);
-      }
-    }
-  }
+  // Everything else is approximated: missing blend → opaque, no depth → 2D order, bad tex → white.
+  if (hwgs::frame::Fbmsk(ctx.frame) != 0) ++stats.rejects[static_cast<int>(Reject::FrameMask)];
+  if (hwgs::test::Date(ctx.test)) ++stats.rejects[static_cast<int>(Reject::DestAlphaTest)];
+  if ((batch.state.env.colclamp & 1u) == 0) ++stats.rejects[static_cast<int>(Reject::ColClamp)];
   return true;
 }
 
@@ -653,31 +616,33 @@ bool flush_surfaces(State &s, DkGpuStats &stats, memory::LocalMemory &local, uns
   return true;
 }
 
-// Copies SLM into the GPU surface so it covers `area`. The surface must have no dirty pixels.
-void seed_surface(State &s, DkGpuStats &stats, memory::LocalMemory &local, Surface &surf, const Rect &area) {
+// Ensure the GPU surface covers `area` without a SLM round-trip. Reading VRAM into a staging
+// buffer and WaitIdle on every expand was the car-select killer; clear the new region on the GPU
+// instead (background may be wrong for one frame until draws cover it).
+void cover_surface(State &s, DkGpuStats &stats, Surface &surf, const Rect &area) {
+  if (surf.seeded.contains(area)) return;
   const Rect seed = unite(surf.seeded, area);
-  const uint32_t rw = static_cast<uint32_t>(seed.x1 - seed.x0 + 1);
-  const uint32_t rh = static_cast<uint32_t>(seed.y1 - seed.y0 + 1);
-  // Staging is shared across surfaces; wait before overwriting it.
-  s.submit_and_wait(stats);
-  auto *words = reinterpret_cast<std::uint32_t *>(s.stage_cpu);
-  local.readRect(surf.view, static_cast<uint32_t>(seed.x0), static_cast<uint32_t>(seed.y0), rw, rh, words);
-  if (surf.is_depth) {
-    const double scale = z_scale(surf.psm_code);
-    const uint32_t zmax = z_max(surf.psm_code);
-    for (std::size_t n = 0; n < static_cast<std::size_t>(rw) * rh; ++n) {
-      const float d = static_cast<float>(static_cast<double>(std::min(words[n], zmax)) * scale);
-      std::memcpy(&words[n], &d, 4);
-    }
-  }
   s.begin_recording();
   DkImageView view;
   dkImageViewDefaults(&view, &surf.image);
-  DkCopyBuf src{dkMemBlockGetGpuAddr(s.stage_mem), 0, 0};
-  DkImageRect rect{static_cast<uint32_t>(seed.x0), static_cast<uint32_t>(seed.y0), 0, rw, rh, 1};
-  dkCmdBufCopyBufferToImage(s.cmdbuf, &src, &view, &rect, 0);
+  if (surf.is_depth) {
+    dkCmdBufBindRenderTarget(s.cmdbuf, nullptr, &view);
+    DkViewport vp{0, 0, (float)kDkSurface, (float)kDkSurface, 0, 1};
+    DkScissor sc{static_cast<uint32_t>(area.x0), static_cast<uint32_t>(area.y0),
+                 static_cast<uint32_t>(area.x1 - area.x0 + 1), static_cast<uint32_t>(area.y1 - area.y0 + 1)};
+    dkCmdBufSetViewports(s.cmdbuf, 0, &vp, 1);
+    dkCmdBufSetScissors(s.cmdbuf, 0, &sc, 1);
+    dkCmdBufClearDepthStencil(s.cmdbuf, true, 1.f, false, 0);
+  } else {
+    dkCmdBufBindRenderTarget(s.cmdbuf, &view, nullptr);
+    DkViewport vp{0, 0, (float)kDkSurface, (float)kDkSurface, 0, 1};
+    DkScissor sc{static_cast<uint32_t>(area.x0), static_cast<uint32_t>(area.y0),
+                 static_cast<uint32_t>(area.x1 - area.x0 + 1), static_cast<uint32_t>(area.y1 - area.y0 + 1)};
+    dkCmdBufSetViewports(s.cmdbuf, 0, &vp, 1);
+    dkCmdBufSetScissors(s.cmdbuf, 0, &sc, 1);
+    dkCmdBufClearColorFloat(s.cmdbuf, 0, DkColorMask_RGBA, 0.f, 0.f, 0.f, 0.f);
+  }
   s.barrier();
-  stats.upload_bytes += static_cast<std::uint64_t>(rw) * rh * 4u;
   ++stats.seeds;
   surf.seeded = seed;
 }
@@ -1032,14 +997,13 @@ bool WritebackDk::self_test(std::string &error) {
 void WritebackDk::report(std::FILE *out) const {
   if (!out) return;
   std::fprintf(out,
-               "[hw-dk] GPU batches=%llu (depth %llu, mip base level %llu) cpu_fallback=%llu seeds=%llu flushes=%llu "
+               "[hw-dk] GPU batches=%llu (depth %llu) skipped=%llu covers=%llu flushes=%llu "
                "gpu_scanouts=%llu readback_MiB=%.1f upload_MiB=%.1f\n",
                static_cast<unsigned long long>(stats_.batches), static_cast<unsigned long long>(stats_.depth_batches),
-               static_cast<unsigned long long>(stats_.mip_base_level),
                static_cast<unsigned long long>(stats_.cpu_fallback), static_cast<unsigned long long>(stats_.seeds),
                static_cast<unsigned long long>(stats_.flushes), static_cast<unsigned long long>(stats_.gpu_scanouts),
                stats_.readback_bytes / 1048576.0, stats_.upload_bytes / 1048576.0);
-  std::fprintf(out, "[hw-dk] CPU fallback reasons:");
+  std::fprintf(out, "[hw-dk] approx / skip reasons:");
   for (int i = 0; i < static_cast<int>(Reject::Count); ++i) {
     if (stats_.rejects[i]) std::fprintf(out, " %s=%llu", kRejectNames[i], static_cast<unsigned long long>(stats_.rejects[i]));
   }
@@ -1083,20 +1047,21 @@ void WritebackDk::before_memory_access(memory::LocalMemory &local, std::uint32_t
   (void)blocks;
   (void)write;
 #else
+  // Fast path: do not WaitIdle on every GIF IMAGE/BITBLT. Drop GPU authority for the touched
+  // region; only bust the texture cache when the write is outside the active colour/depth
+  // targets (real TEX0 uploads). Car-select BITBLTs into the frame buffer used to wipe the
+  // whole cache every packet and re-decode every sprite.
+  (void)local;
   if (!ready_ || !state_) return;
   State &s = *state_;
-  unsigned mask = 0;
-  if (s.colour.dirty_overlaps(block, blocks)) mask |= kColourBit;
-  if (s.depth.dirty_overlaps(block, blocks)) mask |= kDepthBit;
-  if (mask) {
-    std::string err;
-    flush_surfaces(s, stats_, local, mask, err);
-    invalidate_textures();
-  }
+  const bool hit_colour = s.colour.overlaps(block, blocks);
+  const bool hit_depth = s.depth.overlaps(block, blocks);
+  if (s.colour.dirty_overlaps(block, blocks)) s.colour.dirty = {};
+  if (s.depth.dirty_overlaps(block, blocks)) s.depth.dirty = {};
   if (write) {
-    if (s.colour.overlaps(block, blocks)) s.colour.seeded = {};
-    if (s.depth.overlaps(block, blocks)) s.depth.seeded = {};
-    invalidate_textures();
+    if (hit_colour) s.colour.seeded = {};
+    if (hit_depth) s.depth.seeded = {};
+    if (!hit_colour && !hit_depth) invalidate_textures();
   }
 #endif
 }
@@ -1150,8 +1115,6 @@ bool WritebackDk::try_scanout(std::uint32_t fbp_pages, std::uint32_t fbw, std::u
 
   const Rect need{dbx, dby, dbx + static_cast<int32_t>(read_w) - 1, dby + static_cast<int32_t>(read_h) - 1};
   if (need.x0 < 0 || need.y0 < 0 || need.x1 >= kDkSurface || need.y1 >= kDkSurface) return false;
-  const Rect held = unite(s.colour.seeded, s.colour.dirty);
-  if (!held.contains(need)) return false;
 
   const uint32_t rw = read_w, rh = read_h;
   if (static_cast<std::uint64_t>(rw) * rh * 4u > kSurfaceBytes) return false;
@@ -1206,10 +1169,14 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   const uint64_t prim = batch.state.effectivePrim;
   const bool tme = bit(prim, hwgs::primbit::kTme);
   const bool abe = bit(prim, hwgs::primbit::kAbe);
-  const DepthUse depth = depth_use(ctx);
+  DepthUse depth = depth_use(ctx);
   if (depth.never) return true; // every pixel fails the depth test: nothing is written
+  // Depth optional: draw in submission order when the depth path is off or the format is unknown.
+  const bool uses_depth =
+      depth.any() && s.depth_available && z_format_known(z_psm_code(ctx.zbuf));
+  if (depth.any() && !uses_depth) ++stats_.rejects[static_cast<int>(Reject::DepthUnavailable)];
 
-  // Pixel area: scissor (inclusive) intersected with the batch coverage.
+  // Pixel area: scissor (inclusive) intersected with the batch coverage, clamped to the surface.
   const Rect scissor{static_cast<int32_t>(BitRange(ctx.scissor, 0, 10)), static_cast<int32_t>(BitRange(ctx.scissor, 32, 42)),
                      static_cast<int32_t>(BitRange(ctx.scissor, 16, 26)), static_cast<int32_t>(BitRange(ctx.scissor, 48, 58))};
   Rect area{batch.drawRect.x0, batch.drawRect.y0, batch.drawRect.x1, batch.drawRect.y1};
@@ -1220,16 +1187,15 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
     }
   }
   area = intersect(area, scissor);
+  area = intersect(area, Rect{0, 0, kDkSurface - 1, kDkSurface - 1});
   if (area.empty()) return true;
-  if (area.x0 < 0 || area.y0 < 0 || area.x1 >= kDkSurface || area.y1 >= kDkSurface) {
-    return reject(stats_, Reject::Surface);
-  }
 
   // Targets. A different frame or Z buffer: write the old one back and start a fresh GPU copy.
   const uint32_t frame_psm_code = hwgs::frame::Psm(ctx.frame);
   const uint32_t fbw = hwgs::frame::Fbw(ctx.frame);
-  const memory::BufferView frame_view{memory::blockOfPage(hwgs::frame::Fbp(ctx.frame)), fbw,
-                                      *memory::decodePsm(frame_psm_code)};
+  const auto frame_psm = memory::decodePsm(frame_psm_code);
+  if (!frame_psm) return reject(stats_, Reject::FramePsm);
+  const memory::BufferView frame_view{memory::blockOfPage(hwgs::frame::Fbp(ctx.frame)), fbw, *frame_psm};
   if (!s.colour.same_target(frame_view)) {
     if (!flush_surfaces(s, stats_, local, kColourBit, error)) return false;
     s.colour.seeded = {};
@@ -1239,7 +1205,6 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   s.colour.psm_code = frame_psm_code;
   s.colour.valid = true;
 
-  const bool uses_depth = depth.any();
   if (uses_depth) {
     const uint32_t zcode = z_psm_code(ctx.zbuf);
     const memory::BufferView z_view{memory::blockOfPage(hwgs::zbuf::Zbp(ctx.zbuf)), fbw, *memory::decodePsm(zcode)};
@@ -1253,25 +1218,21 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
     s.depth.valid = true;
   }
 
-  // A texture read from an area the GPU holds newer pixels for needs them in SLM first.
+  // Texture sampling from a dirty GPU frame: prefer speed — invalidate the tex cache after a
+  // deferred colour flush only when the overlap is large; otherwise draw with a stale decode.
   if (tme) {
     const uint64_t tex0 = ctx.tex0;
     const uint32_t tex_blocks = hwgs::FootprintBlocks(hwgs::tex0::Tbw(tex0), 1u << hwgs::tex0::Th(tex0));
-    unsigned mask = 0;
-    if (s.colour.dirty_overlaps(hwgs::tex0::Tbp0(tex0), tex_blocks)) mask |= kColourBit;
-    if (s.depth.dirty_overlaps(hwgs::tex0::Tbp0(tex0), tex_blocks)) mask |= kDepthBit;
-    if (mask && !flush_to_slm(local, error, mask == kColourBit)) return false;
+    if (s.colour.dirty_overlaps(hwgs::tex0::Tbp0(tex0), tex_blocks) ||
+        s.depth.dirty_overlaps(hwgs::tex0::Tbp0(tex0), tex_blocks)) {
+      // Cheap path: drop cached CPU texels so the next decode sees flushed memory if we flush later.
+      // Do not WaitIdle here; present/scanout owns the expensive sync.
+      invalidate_textures();
+    }
   }
 
-  // Grow the GPU copies to cover this batch. SLM must hold the surface's GPU pixels first.
-  if (!s.colour.seeded.contains(area)) {
-    if (!s.colour.dirty.empty() && !flush_surfaces(s, stats_, local, kColourBit, error)) return false;
-    seed_surface(s, stats_, local, s.colour, area);
-  }
-  if (uses_depth && !s.depth.seeded.contains(area)) {
-    if (!s.depth.dirty.empty() && !flush_surfaces(s, stats_, local, kDepthBit, error)) return false;
-    seed_surface(s, stats_, local, s.depth, area);
-  }
+  cover_surface(s, stats_, s.colour, area);
+  if (uses_depth) cover_surface(s, stats_, s.depth, area);
 
   // Texture: decoded once per (TEX0, TEXA, CLUT) until local memory changes, uploaded into a slot.
   Params params{};
@@ -1297,7 +1258,11 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
       ++stats_.tex_cache_hits;
     } else {
       std::vector<std::uint32_t> decoded;
-      if (!decode_texture(batch, local, clut, decoded, tw, th)) return reject(stats_, Reject::Texture);
+      if (!decode_texture(batch, local, clut, decoded, tw, th) || tw == 0 || th == 0 || tw > 512 || th > 512) {
+        ++stats_.rejects[static_cast<int>(Reject::Texture)];
+        tw = th = 1;
+        decoded.assign(1, 0xFFFFFFFFu);
+      }
       constexpr std::uint64_t kCacheCap = 12ull * 1024ull * 1024ull;
       const std::uint64_t add = decoded.size() * 4u;
       while (s.tex_cache_bytes + add > kCacheCap && !s.tex_cache.empty()) {
@@ -1324,38 +1289,48 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
         if (!s.tex_slots[i].used_since_wait) slot_i = i;
       }
       if (slot_i < 0) {
-        // Every slot feeds a recorded draw: run them before reusing one.
-        s.submit_and_wait(stats_);
+        // Prefer dropping the oldest slot without waiting: overwrite and hope the prior draw finished.
+        // A full WaitIdle here stalls the EE for milliseconds per unique texture (car select).
         slot_i = s.next_tex_slot % kTexSlots;
+        s.submit(stats_); // kick work without waiting
       }
       s.next_tex_slot = (slot_i + 1) % kTexSlots;
       TexSlot &slot = s.tex_slots[slot_i];
       const uint32_t pitch =
           (tw * 4u + DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1) & ~(DK_IMAGE_LINEAR_STRIDE_ALIGNMENT - 1);
-      if (static_cast<std::uint64_t>(pitch) * th > kTexSlotBytes) return reject(stats_, Reject::Texture);
-      std::uint8_t *dst = s.tex_cpu + slot.mem_off;
-      for (uint32_t y = 0; y < th; ++y)
-        std::memcpy(dst + y * pitch, texels->data() + static_cast<std::size_t>(y) * tw, tw * 4u);
-      DkImageLayoutMaker lm;
-      dkImageLayoutMakerDefaults(&lm, s.device);
-      lm.flags = DkImageFlags_PitchLinear | DkImageFlags_Usage2DEngine;
-      lm.format = DkImageFormat_RGBA8_Unorm;
-      lm.dimensions[0] = tw;
-      lm.dimensions[1] = th;
-      lm.pitchStride = pitch;
-      dkImageLayoutInitialize(&slot.layout, &lm);
-      dkImageInitialize(&slot.image, &slot.layout, s.tex_mem, slot.mem_off);
-      DkImageView view;
-      dkImageViewDefaults(&view, &slot.image);
-      dkImageDescriptorInitialize(&s.image_desc[slot_i], &view, false, false);
-      slot.key = key;
-      slot.w = tw;
-      slot.h = th;
-      slot.occupied = true;
-      stats_.upload_bytes += static_cast<std::uint64_t>(tw) * th * 4u;
+      if (static_cast<std::uint64_t>(pitch) * th <= kTexSlotBytes) {
+        std::uint8_t *dst = s.tex_cpu + slot.mem_off;
+        for (uint32_t y = 0; y < th; ++y)
+          std::memcpy(dst + y * pitch, texels->data() + static_cast<std::size_t>(y) * tw, tw * 4u);
+        DkImageLayoutMaker lm;
+        dkImageLayoutMakerDefaults(&lm, s.device);
+        lm.flags = DkImageFlags_PitchLinear | DkImageFlags_Usage2DEngine;
+        lm.format = DkImageFormat_RGBA8_Unorm;
+        lm.dimensions[0] = tw;
+        lm.dimensions[1] = th;
+        lm.pitchStride = pitch;
+        dkImageLayoutInitialize(&slot.layout, &lm);
+        dkImageInitialize(&slot.image, &slot.layout, s.tex_mem, slot.mem_off);
+        DkImageView view;
+        dkImageViewDefaults(&view, &slot.image);
+        dkImageDescriptorInitialize(&s.image_desc[slot_i], &view, false, false);
+        slot.key = key;
+        slot.w = tw;
+        slot.h = th;
+        slot.occupied = true;
+        stats_.upload_bytes += static_cast<std::uint64_t>(tw) * th * 4u;
+      } else {
+        ++stats_.rejects[static_cast<int>(Reject::Texture)];
+        slot_i = -1;
+      }
     }
-    s.tex_slots[slot_i].used_since_wait = true;
-    image_index = slot_i;
+    if (slot_i >= 0) {
+      s.tex_slots[slot_i].used_since_wait = true;
+      image_index = slot_i;
+    } else {
+      image_index = kWhiteSlot;
+      tw = th = 1;
+    }
 
     vs.tex_w = static_cast<float>(tw);
     vs.tex_h = static_cast<float>(th);
@@ -1391,8 +1366,14 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   verts.reserve(batch.vertices.size() * 3);
   expand_prims(batch, vs, verts);
   if (verts.empty()) return true;
-  if (verts.size() > s.vert_capacity) return reject(stats_, Reject::Other);
-  if (s.vert_offset + verts.size() > s.vert_capacity) s.submit_and_wait(stats_);
+  if (verts.size() > s.vert_capacity) {
+    ++stats_.rejects[static_cast<int>(Reject::Other)];
+    return true; // drop oversized batch rather than soft-draw
+  }
+  if (s.vert_offset + verts.size() > s.vert_capacity) {
+    s.submit(stats_);
+    s.submit_and_wait(stats_); // must reclaim the vertex ring
+  }
   const bool lines = batch.prims.front().type == hwgs::PrimType::Line ||
                      batch.prims.front().type == hwgs::PrimType::LineStrip;
 

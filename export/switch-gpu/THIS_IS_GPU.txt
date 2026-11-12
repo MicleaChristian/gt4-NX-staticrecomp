@@ -1,0 +1,10 @@
+GT4Recomp Switch — CoreGS / deko3d GPU build (TASK-174)
+
+This NRO never soft-rasters GS batches on the CPU.
+- Batches go through WritebackDk (deko3d). Rejected batches are dropped, not DrawBatch'd.
+- Present framebuffer is 640x448 (OS scales); no CPU upscale to 1280x720.
+- Texture cache survives frame-buffer BITBLTs (FMV / car-select thrash fix).
+- Interlaced FFMD menus hold the previous field on odd presents.
+
+Copy gt4recomp.nro + your ISO to sdmc:/switch/gt4recomp/
+Check stderr.log for: gpu_draws, gpu_cpu_fallback (~0), gpu_composed / scanouts.

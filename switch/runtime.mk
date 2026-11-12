@@ -15,7 +15,7 @@ EE_DIR_REL  := $(SWITCH_EE_GENERATED)
 ifeq ($(strip $(EE_DIR_REL)),)
 EE_DIR_REL  := ../private/switch-ee/generated
 endif
-EE_DIR      := $(SWITCH_EE_GENERATED_ABS)
+EE_DIR      := $(EE_DIR_REL)
 HW_GS      := ../native/hw_gs
 NATIVE     := ../native
 TOOLS_DIR  := tools
@@ -63,10 +63,12 @@ $(BUILD)/gs_draw_fsh_dksh.hpp: $(DK_SHADERS)/gs_draw_fsh.glsl $(EMBED_DKSH) | $(
 EE_UNITS := $(shell ls "$(EE_DIR_REL)"/*.cpp 2>/dev/null)
 EE_OBJS  := $(addprefix $(BUILD)/ee_,$(addsuffix .o,$(basename $(notdir $(EE_UNITS)))))
 
-CXXFLAGS_RT := $(CXXFLAGS) -I"$(abspath $(RUNTIME_INC))" -I"$(abspath $(EE_DIR_REL))" -DGT4_SWITCH_RUNTIME=1 \
-  -I"$(abspath $(HW_GS))" -I"$(abspath $(HW_GS)/frontend)" -I"$(abspath $(HW_GS)/memory)" -I"$(abspath $(HW_GS)/clut)" \
-  -I"$(abspath $(HW_GS)/pixel)" -I"$(abspath $(HW_GS)/display)" -I"$(abspath $(HW_GS)/cpuref)" -I"$(abspath $(HW_GS)/backend_dk)" \
-  -I"$(abspath $(NATIVE))" -I"$(abspath include)" -I"$(abspath $(VU_RECOMP))" -I"$(abspath $(VU1_GEN))"
+# Relative -I only: $(abspath) resolves the D:\gt4sr junction to a path with spaces and
+# make splits those tokens (quotes are not grouping in make).
+CXXFLAGS_RT := $(CXXFLAGS) -I"$(RUNTIME_INC)" -I"$(EE_DIR_REL)" -DGT4_SWITCH_RUNTIME=1 \
+  -I"$(HW_GS)" -I"$(HW_GS)/frontend" -I"$(HW_GS)/memory" -I"$(HW_GS)/clut" \
+  -I"$(HW_GS)/pixel" -I"$(HW_GS)/display" -I"$(HW_GS)/cpuref" -I"$(HW_GS)/backend_dk" \
+  -I"$(NATIVE)" -I"include" -I"$(VU_RECOMP)" -I"$(VU1_GEN)"
 
 $(BUILD)/rt_memory.o: $(RUNTIME_SRC)/memory.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
@@ -100,7 +102,7 @@ $(BUILD)/rt_vu_jit.o: $(RUNTIME_SRC)/vu_jit.cpp | $(BUILD)
 $(BUILD)/rt_vu_jit_web.o: $(RUNTIME_SRC)/vu_jit_web.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
 $(BUILD)/rt_ipu.o: $(IPU_FAST_SRC) | $(BUILD)
-	$(CXX) $(CXXFLAGS_RT) -I"$(abspath $(RUNTIME_SRC))" -c "$<" -o "$@"
+	$(CXX) $(CXXFLAGS_RT) -I"$(RUNTIME_SRC)" -c "$<" -o "$@"
 $(BUILD)/vu_sha256.o: $(VU_RECOMP)/sha256.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
 $(BUILD)/vu1_generated_table.o: $(VU1_GEN)/vu1_generated.cpp | $(BUILD)
@@ -169,7 +171,7 @@ $(BUILD)/hw_gs_backend_dk.o: $(HW_GS)/backend_dk/hw_gs_backend_dk.cpp | $(BUILD)
 $(BUILD)/dk_gpu.o: $(HW_GS)/backend_dk/dk_gpu.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
 $(BUILD)/writeback_dk.o: $(HW_GS)/backend_dk/writeback_dk.cpp $(BUILD)/gs_draw_vsh_dksh.hpp $(BUILD)/gs_draw_fsh_dksh.hpp | $(BUILD)
-	$(CXX) $(CXXFLAGS_RT) -I"$(abspath $(BUILD))" -c "$<" -o "$@"
+	$(CXX) $(CXXFLAGS_RT) -I"$(BUILD)" -c "$<" -o "$@"
 $(BUILD)/cpuref_memory.o: $(HW_GS)/cpuref/cpuref_memory.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"
 $(BUILD)/cpuref_draw.o: $(HW_GS)/cpuref/cpuref_draw.cpp | $(BUILD)
