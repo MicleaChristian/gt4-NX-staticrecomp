@@ -563,9 +563,15 @@ struct WritebackDk::State {
       ++stats.submissions;
     }
   }
+  bool gpu_error = false; // the queue faulted: no further GPU draws
   void submit_and_wait(DkGpuStats &stats) {
     submit(stats);
     dkQueueWaitIdle(queue);
+    if (!gpu_error && dkQueueIsInErrorState(queue)) {
+      gpu_error = true;
+      std::fprintf(stderr, "[hw-dk] GPU queue error after %llu submissions: GPU drawer off, CPU draws the rest\n",
+                   static_cast<unsigned long long>(stats.submissions));
+    }
     vert_offset = 0;
     for (auto &slot : tex_slots) slot.used_since_wait = false;
   }
@@ -688,6 +694,12 @@ bool make_surface_image(DkDevice device, Surface &surf, DkImageFormat format, ui
 } // namespace
 #endif
 
+namespace {
+bool g_allowed = true;
+}
+
+void WritebackDk::set_allowed(bool allowed) { g_allowed = allowed; }
+
 bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   shutdown();
 #if !defined(__SWITCH__)
@@ -695,6 +707,11 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   error = "WritebackDk requires __SWITCH__";
   return false;
 #else
+  if (!g_allowed) {
+    error = "GPU drawer disabled by gpudraw.off";
+    return false;
+  }
+  std::fprintf(stderr, "[hw-dk] WritebackDk init\n");
   if (!handles.device || !handles.queue) {
     error = "WritebackDk: missing device/queue";
     return false;
@@ -741,6 +758,7 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
     return false;
   }
 
+  std::fprintf(stderr, "[hw-dk] init: shaders loaded\n");
   // Copy-engine seeding and readback write the images directly, so neither uses compression.
   if (!make_surface_image(s.device, s.colour, DkImageFormat_RGBA8_Unorm,
                           DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine, error) ||
@@ -748,7 +766,7 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
     shutdown();
     return false;
   }
-  s.depth.is_depth = true;
+  std::fprintf(stderr, "[hw-dk] init: colour and depth surfaces created\n");
   s.colour.stage_off = 0;
   s.depth.stage_off = kSurfaceBytes;
 
@@ -841,6 +859,7 @@ bool WritebackDk::init(const DkHandles &handles, std::string &error) {
   }
 
   ready_ = true;
+  std::fprintf(stderr, "[hw-dk] init: buffers and descriptors ready, running self-test\n");
   if (!self_test(error)) {
     std::fprintf(stderr, "[hw-dk] WritebackDk self-test failed: %s (GPU drawer off, CPU draws everything)\n",
                  error.c_str());
@@ -932,8 +951,15 @@ bool WritebackDk::self_test(std::string &error) {
     reset_surfaces();
     std::vector<std::uint32_t> zero(16 * 16, 0);
     local->writeRect(frame_view, 0, 0, 16, 16, zero.data());
+    std::fprintf(stderr, "[hw-dk] self-test: colour sprite, y_sign=%+.0f\n", sign);
     if (!draw_batch(make_sprite(0, 0, 8, 8, 0, 255, 0, false), *local, clut, error)) return false;
     flush_to_slm(*local, error);
+    std::fprintf(stderr, "[hw-dk] self-test: colour read back, pixel(2,2)=0x%08X queue_error=%d\n",
+                 local->readPixel(frame_view, 2, 2), s.gpu_error ? 1 : 0);
+    if (s.gpu_error) {
+      error = "GPU queue error during the colour self-test";
+      return false;
+    }
     if (red_at(2, 2) && red_at(7, 7) && !red_at(8, 8)) {
       oriented = true;
       break;
@@ -951,10 +977,12 @@ bool WritebackDk::self_test(std::string &error) {
   std::vector<std::uint32_t> zero(16 * 16, 0), z1000(16 * 16, 1000);
   local->writeRect(frame_view, 0, 0, 16, 16, zero.data());
   local->writeRect(z_view, 0, 0, 16, 16, z1000.data());
+  std::fprintf(stderr, "[hw-dk] self-test: depth sprites\n");
   bool depth_ok = draw_batch(make_sprite(0, 0, 8, 8, 2000, 255, 0, true), *local, clut, error) &&
                   draw_batch(make_sprite(0, 0, 4, 4, 500, 0, 255, true), *local, clut, error);
   flush_to_slm(*local, error);
-  depth_ok = depth_ok && red_at(2, 2) && red_at(6, 6) && (local->readPixel(z_view, 2, 2) & 0xFFFFFFu) == 2000u &&
+  std::fprintf(stderr, "[hw-dk] self-test: depth read back, queue_error=%d\n", s.gpu_error ? 1 : 0);
+  depth_ok = depth_ok && !s.gpu_error && red_at(2, 2) && red_at(6, 6) && (local->readPixel(z_view, 2, 2) & 0xFFFFFFu) == 2000u &&
              (local->readPixel(z_view, 12, 12) & 0xFFFFFFu) == 1000u;
   if (!depth_ok) {
     std::fprintf(stderr, "[hw-dk] depth self-test failed (pixel 0x%08X z %u): depth batches stay on the CPU\n",
@@ -1072,6 +1100,7 @@ bool WritebackDk::draw_batch(const hwgs::Batch &batch, memory::LocalMemory &loca
   }
   if (batch.Empty()) return true;
   State &s = *state_;
+  if (s.gpu_error) return reject(stats_, Reject::Other);
   if (!accept_batch(batch, s.depth_available, stats_)) return false;
 
   const auto &ctx = batch.state.ctx;

@@ -225,8 +225,8 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
   g_last_app_dir = app;
   // stderr -> stderr.log next to the NRO (CoreGS / WritebackDk / donor diagnostics).
   if (std::freopen((app + "/stderr.log").c_str(), "wb", stderr)) {
-    static char stderr_buffer[64 * 1024];
-    std::setvbuf(stderr, stderr_buffer, _IOLBF, sizeof stderr_buffer);
+    // Unbuffered: a crash must not take the last lines with it (stderr is not on a hot path).
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
   }
   gt4::perf::open_log(app.c_str());
   std::fprintf(stderr,
@@ -257,7 +257,7 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
   const auto settings = gt4::switch_app::load_settings(std::filesystem::path(app));
   if (!settings.coregs) {
     std::fprintf(stderr, "[gt4-switch] WARNING: coregs.off found; donor CPU GS (debug only, very slow)\n");
-  } else if (!gt4::switch_app::coregs_start()) {
+  } else if (!gt4::switch_app::coregs_start(settings.gpu_draw)) {
     std::fprintf(stderr, "[gt4-switch] ERROR: CoreGS start failed; falling back to donor CPU GS (very slow)\n");
     write_halt_log("CoreGS start failed; see stderr.log");
   }

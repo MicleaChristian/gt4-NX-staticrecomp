@@ -7,7 +7,7 @@
 namespace gt4::switch_app {
 
 // Starts GT4_RENDERER=hw with BackendDk. Returns false if init fails (caller keeps donor GS).
-bool coregs_start();
+bool coregs_start(bool gpu_draw);
 void coregs_stop();
 bool coregs_active();
 

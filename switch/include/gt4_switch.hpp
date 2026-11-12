@@ -16,6 +16,8 @@ struct AppSettings {
   // CoreGS BackendDk is the only supported renderer. A `coregs.off` file next to the NRO
   // falls back to the donor CPU GS for debugging; gt4recomp.ini no longer controls it.
   bool coregs = true;
+  // A `gpudraw.off` file keeps CoreGS but draws every batch on the CPU (GPU drawer debugging).
+  bool gpu_draw = true;
 };
 
 std::vector<std::filesystem::path> find_isos_in(const std::filesystem::path &directory);

@@ -1,6 +1,7 @@
 #include "coregs_nx.hpp"
 
 #include "hw_gs_dispatch.hpp"
+#include "hw_gs/backend_dk/writeback_dk.hpp"
 #include "platform/nx/deko3d_present.hpp"
 
 #include <cstdio>
@@ -105,8 +106,10 @@ const char *lookup_env(const char *name) {
 
 } // namespace
 
-bool coregs_start() {
+bool coregs_start(bool gpu_draw) {
   coregs_stop();
+  hwgs::dk::WritebackDk::set_allowed(gpu_draw);
+  if (!gpu_draw) std::fprintf(stderr, "[gt4-switch] gpudraw.off found: CoreGS draws every batch on the CPU\n");
   try {
     g_dispatch = std::make_unique<gt4::hw::Dispatch>(lookup_env);
   } catch (const gt4::hw::OptionError &e) {

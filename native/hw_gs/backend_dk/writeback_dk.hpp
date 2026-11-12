@@ -87,6 +87,9 @@ public:
   const DkGpuStats &stats() const { return stats_; }
   int surface() const { return kDkSurface; }
 
+  // Host switch (Switch `gpudraw.off`): when false, init() refuses and CoreGS draws on the CPU.
+  static void set_allowed(bool allowed);
+
   struct State; // deko3d objects; defined in writeback_dk.cpp only
 
 private:

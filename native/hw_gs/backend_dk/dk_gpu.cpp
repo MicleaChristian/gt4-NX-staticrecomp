@@ -2,6 +2,8 @@
 
 #include "platform/nx/deko3d_present.hpp"
 
+#include <cstdio>
+
 #if defined(__SWITCH__)
 #include <deko3d.h>
 #endif
@@ -10,6 +12,12 @@ namespace hwgs::dk {
 namespace {
 #if defined(__SWITCH__)
 DkMemBlock g_cmd_mem = nullptr;
+
+void log_deko3d_error(void *, const char *context, DkResult result, const char *message) {
+  std::fprintf(stderr, "[hw-dk] deko3d error %d in %s: %s\n", static_cast<int>(result), context ? context : "?",
+               message ? message : "");
+  std::fflush(stderr);
+}
 #endif
 } // namespace
 
@@ -18,6 +26,7 @@ bool create_device(DkHandles &out, std::string &error) {
 #if defined(__SWITCH__)
   DkDeviceMaker deviceMaker;
   dkDeviceMakerDefaults(&deviceMaker);
+  deviceMaker.cbDebug = log_deko3d_error;
   DkDevice device = dkDeviceCreate(&deviceMaker);
   if (!device) {
     error = "dkDeviceCreate failed";

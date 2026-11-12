@@ -26,6 +26,7 @@ AppSettings load_settings(const std::filesystem::path &app_dir) {
   }
   if (s.scale > 2) s.scale = 2; // Switch v1: keep host memory small
   if (std::filesystem::exists(app_dir / "coregs.off")) s.coregs = false;
+  if (std::filesystem::exists(app_dir / "gpudraw.off")) s.gpu_draw = false;
   return s;
 }
 
