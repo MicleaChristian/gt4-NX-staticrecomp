@@ -80,8 +80,8 @@ int main(int argc, char *argv[]) {
     // Switch X: long run. Soft FB + cyan OSD. Plus aborts (after a short grace). Home exits.
     if (pad.triangle && !triangle_prev && (status == RuntimeStatus::Ready || status == RuntimeStatus::Ran)) {
       std::vector<std::string> notice{
-          "Long run: CPU GS + pad wired. B=Cross(OK), A=Circle, D-pad move.",
-          "Hold Plus ~1.5s to abort. Choppy until CoreGS GPU.",
+          "Long run: CoreGS GPU + pad. B=Cross(OK), A=Circle, D-pad move.",
+          "Hold Plus 1 second (wall clock) to abort and write logs.",
           host.application_mode ? "Mode: Application." : "WARNING: Applet mode - may OOM silently.",
       };
       gt4::switch_app::present_status_lines(notice);
@@ -103,7 +103,7 @@ int main(int argc, char *argv[]) {
     lines.push_back(runtime_message);
     lines.push_back("scale=" + std::to_string(settings.scale) +
                     "  performance=" + std::string(settings.performance_mode ? "on" : "off"));
-    lines.push_back("A: smoke 300f (~5s) | X: long run | Plus: exit menu");
+    lines.push_back("A: smoke 300f | X: long run | hold Plus 1s: quit run | Plus in menu: exit app");
     lines.push_back("Minus: Performance | L+R: scale");
     if (!host.application_mode)
       lines.push_back("TIP: hold R when launching a title to force full RAM, or use hbmenu title override.");

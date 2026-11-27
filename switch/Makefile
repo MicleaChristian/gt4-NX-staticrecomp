@@ -73,7 +73,10 @@ else
 CXXFLAGS := $(CFLAGS) -fno-rtti -std=gnu++20
 endif
 LIBDIRS  := $(LIBNX)/lib
-LDFLAGS  = -specs="$(DEVKITPRO)/libnx/switch.specs" -g $(ARCH) -Wl,-Map,"$(BUILD)/$(TARGET).map" $(foreach dir,$(LIBDIRS),-L"$(dir)")
+# --undefined keeps gt4_switch_game_main under libnx --gc-sections; __attribute__((used))
+# alone still lets GNU ld drop an unreferenced .text.* section.
+LDFLAGS  = -specs="$(DEVKITPRO)/libnx/switch.specs" -g $(ARCH) -Wl,-Map,"$(BUILD)/$(TARGET).map" \
+	-Wl,--undefined=gt4_switch_game_main $(foreach dir,$(LIBDIRS),-L"$(dir)")
 LIBS     := -ldeko3d -lnx
 
 CPPFILES := main.cpp iso_find.cpp runtime_bridge.cpp deko3d_present.cpp audio_nx.cpp pad_nx.cpp settings_nx.cpp

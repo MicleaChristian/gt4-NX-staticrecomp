@@ -1,0 +1,1069 @@
+diff --git a/runtime/include/ps2/memory.hpp b/runtime/include/ps2/memory.hpp
+index 56f61d0..1ce8933 100644
+--- a/runtime/include/ps2/memory.hpp
++++ b/runtime/include/ps2/memory.hpp
+@@ -5,6 +5,19 @@
+ #include <cstdint>
+ #include <cstring>
+ 
++// NX-2026-11-27-CB: on the Switch (GCC) the guest memory helpers below were not inlined into the
++// translated game code. Each translated unit is one very large function, and GCC stops inlining
++// into a function once it has grown past its limits: in unit_011A (the game's video code) 830 of
++// about 1,000 memory accesses were calls to out-of-line copies of ld32 / st32 / ld64 / st64 /
++// ld128 / st128 (run CA, sampling profiler: those copies alone were 7% of the main thread in the
++// menus, before counting what a call in the middle of a block costs the code around it). The PC
++// build's compiler inlines them. Forced here.
++#if defined(__SWITCH__) && defined(__GNUC__)
++#define PS2_MEM_INLINE inline __attribute__((always_inline))
++#else
++#define PS2_MEM_INLINE inline
++#endif
++
+ namespace ps2 {
+ 
+ inline constexpr std::uint32_t kRamSize = 32u << 20;
+@@ -26,68 +39,68 @@ void slow_st64(std::uint32_t a, std::uint64_t v);
+ void slow_st128(std::uint32_t a, const Reg128 &v);
+ 
+ template <typename T>
+-inline T *fast(std::uint32_t a) {
++PS2_MEM_INLINE T *fast(std::uint32_t a) {
+     if (a < kRamSize) [[likely]] return reinterpret_cast<T *>(g_ram + a);
+     if ((a >> 14) == (kScratchpadBase >> 14)) return reinterpret_cast<T *>(g_spr + (a & (kScratchpadSize - 1)));
+     return nullptr;
+ }
+ 
+ template <typename T>
+-inline T load(const void *p) {
++PS2_MEM_INLINE T load(const void *p) {
+     T v;
+     std::memcpy(&v, p, sizeof v);
+     return v;
+ }
+ 
+ template <typename T>
+-inline void store(void *p, T v) { std::memcpy(p, &v, sizeof v); }
++PS2_MEM_INLINE void store(void *p, T v) { std::memcpy(p, &v, sizeof v); }
+ 
+-inline std::uint8_t ld8(std::uint32_t a) {
++PS2_MEM_INLINE std::uint8_t ld8(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return *p;
+     return slow_ld8(a);
+ }
+ 
+-inline std::uint16_t ld16(std::uint32_t a) {
++PS2_MEM_INLINE std::uint16_t ld16(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint16_t>(p);
+     return slow_ld16(a);
+ }
+ 
+-inline std::uint32_t ld32(std::uint32_t a) {
++PS2_MEM_INLINE std::uint32_t ld32(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint32_t>(p);
+     return slow_ld32(a);
+ }
+ 
+-inline std::uint64_t ld64(std::uint32_t a) {
++PS2_MEM_INLINE std::uint64_t ld64(std::uint32_t a) {
+     if (auto *p = fast<std::uint8_t>(a)) return load<std::uint64_t>(p);
+     return slow_ld64(a);
+ }
+ 
+-inline void ld128(std::uint32_t a, Reg128 &out) {
++PS2_MEM_INLINE void ld128(std::uint32_t a, Reg128 &out) {
+     if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(&out, p, 16); return; }
+     slow_ld128(a, out);
+ }
+ 
+-inline void st8(std::uint32_t a, std::uint8_t v) {
++PS2_MEM_INLINE void st8(std::uint32_t a, std::uint8_t v) {
+     if (auto *p = fast<std::uint8_t>(a)) { *p = v; return; }
+     slow_st8(a, v);
+ }
+ 
+-inline void st16(std::uint32_t a, std::uint16_t v) {
++PS2_MEM_INLINE void st16(std::uint32_t a, std::uint16_t v) {
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st16(a, v);
+ }
+ 
+-inline void st32(std::uint32_t a, std::uint32_t v) {
++PS2_MEM_INLINE void st32(std::uint32_t a, std::uint32_t v) {
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st32(a, v);
+ }
+ 
+-inline void st64(std::uint32_t a, std::uint64_t v) {
++PS2_MEM_INLINE void st64(std::uint32_t a, std::uint64_t v) {
+     if (auto *p = fast<std::uint8_t>(a)) { store(p, v); return; }
+     slow_st64(a, v);
+ }
+ 
+-inline void st128(std::uint32_t a, const Reg128 &v) {
++PS2_MEM_INLINE void st128(std::uint32_t a, const Reg128 &v) {
+     if (auto *p = fast<std::uint8_t>(a)) { std::memcpy(p, &v, 16); return; }
+     slow_st128(a, v);
+ }
+diff --git a/runtime/include/ps2/mmi.hpp b/runtime/include/ps2/mmi.hpp
+index b680549..1a45a00 100644
+--- a/runtime/include/ps2/mmi.hpp
++++ b/runtime/include/ps2/mmi.hpp
+@@ -30,6 +30,121 @@ inline T sat_sub(T a, T b) {
+     }
+ }
+ 
++// NX-2026-11-27-BY: on the Switch the two-operand 128-bit operations are single NEON instructions
++// with the same lane results as the loops in the #else branch (wrapping and saturating add and
++// subtract, compares, min/max, bit operations, and the interleave / pack / copy shuffles). The
++// loops cost about 100 instructions for a 16-lane saturating add. The game's video decoder does
++// its motion compensation with these operations (run BX: about 17 ms of translated code per
++// frame in the video menus at the stock clock).
++#if defined(__aarch64__)
++} // namespace ps2::mmi
++#include <arm_neon.h>
++namespace ps2::mmi {
++
++inline uint8x16_t nx_load(const Reg128 &r) { return vld1q_u8(reinterpret_cast<const std::uint8_t *>(&r)); }
++inline void nx_store(Reg128 &r, uint8x16_t v) { vst1q_u8(reinterpret_cast<std::uint8_t *>(&r), v); }
++
++#define NX_U8(x) (x)
++#define NX_FROM_U16(x) vreinterpretq_u8_u16(x)
++#define NX_FROM_U32(x) vreinterpretq_u8_u32(x)
++#define NX_FROM_U64(x) vreinterpretq_u8_u64(x)
++#define NX_FROM_S8(x) vreinterpretq_u8_s8(x)
++#define NX_FROM_S16(x) vreinterpretq_u8_s16(x)
++#define NX_FROM_S32(x) vreinterpretq_u8_s32(x)
++#define S8 vreinterpretq_s8_u8(S)
++#define T8 vreinterpretq_s8_u8(T)
++#define S16 vreinterpretq_s16_u8(S)
++#define T16 vreinterpretq_s16_u8(T)
++#define S32 vreinterpretq_s32_u8(S)
++#define T32 vreinterpretq_s32_u8(T)
++#define SU16 vreinterpretq_u16_u8(S)
++#define TU16 vreinterpretq_u16_u8(T)
++#define SU32 vreinterpretq_u32_u8(S)
++#define TU32 vreinterpretq_u32_u8(T)
++#define SU64 vreinterpretq_u64_u8(S)
++#define TU64 vreinterpretq_u64_u8(T)
++
++#define PS2_NEON(name, expr) \
++    inline void name(Reg128 &d, const Reg128 &s, const Reg128 &t) { \
++        const uint8x16_t S = nx_load(s), T = nx_load(t); \
++        (void)S; \
++        (void)T; \
++        nx_store(d, (expr)); \
++    }
++
++PS2_NEON(paddw, NX_FROM_U32(vaddq_u32(SU32, TU32)))
++PS2_NEON(psubw, NX_FROM_U32(vsubq_u32(SU32, TU32)))
++PS2_NEON(paddh, NX_FROM_U16(vaddq_u16(SU16, TU16)))
++PS2_NEON(psubh, NX_FROM_U16(vsubq_u16(SU16, TU16)))
++PS2_NEON(paddb, vaddq_u8(S, T))
++PS2_NEON(psubb, vsubq_u8(S, T))
++PS2_NEON(paddsw, NX_FROM_S32(vqaddq_s32(S32, T32)))
++PS2_NEON(psubsw, NX_FROM_S32(vqsubq_s32(S32, T32)))
++PS2_NEON(paddsh, NX_FROM_S16(vqaddq_s16(S16, T16)))
++PS2_NEON(psubsh, NX_FROM_S16(vqsubq_s16(S16, T16)))
++PS2_NEON(paddsb, NX_FROM_S8(vqaddq_s8(S8, T8)))
++PS2_NEON(psubsb, NX_FROM_S8(vqsubq_s8(S8, T8)))
++PS2_NEON(padduw, NX_FROM_U32(vqaddq_u32(SU32, TU32)))
++PS2_NEON(psubuw, NX_FROM_U32(vqsubq_u32(SU32, TU32)))
++PS2_NEON(padduh, NX_FROM_U16(vqaddq_u16(SU16, TU16)))
++PS2_NEON(psubuh, NX_FROM_U16(vqsubq_u16(SU16, TU16)))
++PS2_NEON(paddub, vqaddq_u8(S, T))
++PS2_NEON(psubub, vqsubq_u8(S, T))
++PS2_NEON(pcgtw, NX_FROM_U32(vcgtq_s32(S32, T32)))
++PS2_NEON(pcgth, NX_FROM_U16(vcgtq_s16(S16, T16)))
++PS2_NEON(pcgtb, vcgtq_s8(S8, T8))
++PS2_NEON(pceqw, NX_FROM_U32(vceqq_u32(SU32, TU32)))
++PS2_NEON(pceqh, NX_FROM_U16(vceqq_u16(SU16, TU16)))
++PS2_NEON(pceqb, vceqq_u8(S, T))
++PS2_NEON(pmaxw, NX_FROM_S32(vmaxq_s32(S32, T32)))
++PS2_NEON(pminw, NX_FROM_S32(vminq_s32(S32, T32)))
++PS2_NEON(pmaxh, NX_FROM_S16(vmaxq_s16(S16, T16)))
++PS2_NEON(pminh, NX_FROM_S16(vminq_s16(S16, T16)))
++// Lanes 0-3: s - t; lanes 4-7: s + t.
++PS2_NEON(padsbh, NX_FROM_U16(vcombine_u16(vget_low_u16(vsubq_u16(SU16, TU16)), vget_high_u16(vaddq_u16(SU16, TU16)))))
++PS2_NEON(pand, vandq_u8(S, T))
++PS2_NEON(por, vorrq_u8(S, T))
++PS2_NEON(pxor, veorq_u8(S, T))
++PS2_NEON(pnor, vmvnq_u8(vorrq_u8(S, T)))
++// Interleaves: even result lanes from t, odd ones from s.
++PS2_NEON(pextlw, NX_FROM_U32(vzip1q_u32(TU32, SU32)))
++PS2_NEON(pextuw, NX_FROM_U32(vzip2q_u32(TU32, SU32)))
++PS2_NEON(pextlh, NX_FROM_U16(vzip1q_u16(TU16, SU16)))
++PS2_NEON(pextuh, NX_FROM_U16(vzip2q_u16(TU16, SU16)))
++PS2_NEON(pextlb, vzip1q_u8(T, S))
++PS2_NEON(pextub, vzip2q_u8(T, S))
++// Packs: the even lanes of t, then the even lanes of s.
++PS2_NEON(ppacw, NX_FROM_U32(vuzp1q_u32(TU32, SU32)))
++PS2_NEON(ppach, NX_FROM_U16(vuzp1q_u16(TU16, SU16)))
++PS2_NEON(ppacb, vuzp1q_u8(T, S))
++// t0 s4 t1 s5 t2 s6 t3 s7
++PS2_NEON(pinth, NX_FROM_U16(vzip1q_u16(TU16, vextq_u16(SU16, SU16, 4))))
++// t0 s0 t2 s2 t4 s4 t6 s6
++PS2_NEON(pinteh, NX_FROM_U16(vtrn1q_u16(TU16, SU16)))
++PS2_NEON(pcpyld, NX_FROM_U64(vcombine_u64(vget_low_u64(TU64), vget_low_u64(SU64))))
++PS2_NEON(pcpyud, NX_FROM_U64(vcombine_u64(vget_high_u64(SU64), vget_high_u64(TU64))))
++
++#undef PS2_NEON
++#undef NX_U8
++#undef NX_FROM_U16
++#undef NX_FROM_U32
++#undef NX_FROM_U64
++#undef NX_FROM_S8
++#undef NX_FROM_S16
++#undef NX_FROM_S32
++#undef S8
++#undef T8
++#undef S16
++#undef T16
++#undef S32
++#undef T32
++#undef SU16
++#undef TU16
++#undef SU32
++#undef TU32
++#undef SU64
++#undef TU64
++#else
+ #define PS2_LANES(name, field, count, expr) \
+     inline void name(Reg128 &d, const Reg128 &s, const Reg128 &t) { \
+         Reg128 r; \
+@@ -85,6 +200,7 @@ PS2_LANES(pcpyld, d, 2, i ? s.d[0] : t.d[0])
+ PS2_LANES(pcpyud, d, 2, i ? t.d[1] : s.d[1])
+ 
+ #undef PS2_LANES
++#endif
+ 
+ #define PS2_UNARY(name, field, count, expr) \
+     inline void name(Reg128 &d, const Reg128 &t) { \
+diff --git a/runtime/include/ps2/vu_ops.hpp b/runtime/include/ps2/vu_ops.hpp
+index c6fabf1..7d85cb9 100644
+--- a/runtime/include/ps2/vu_ops.hpp
++++ b/runtime/include/ps2/vu_ops.hpp
+@@ -134,9 +134,25 @@ PS2_VU_INLINE void vstore(Reg128 &r, v4u v) { std::memcpy(&r, &v, 16); }
+ PS2_VU_INLINE v4u vsplat(std::uint32_t x) { return v4u{x, x, x, x}; }
+ PS2_VU_INLINE v4u vsel(v4u old, v4u now, v4u mask) { return (now & mask) | (old & ~mask); }
+ PS2_VU_INLINE v4u vfix(v4u x) {
++#if defined(__clang__)
+     const v4i clamped = __builtin_elementwise_min((v4i)(x & 0x7FFFFFFFu), (v4i){0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF, 0x7F7FFFFF});
+     const v4i normal = (v4f)clamped >= (v4f)(v4i){0x00800000, 0x00800000, 0x00800000, 0x00800000};
+     return (x & 0x80000000u) | (v4u)(clamped & normal);
++#else
++    // GCC / devkitA64: no __builtin_elementwise_min — flush each lane with the scalar helpers.
++    alignas(16) std::uint32_t lanes[4];
++    std::memcpy(lanes, &x, 16);
++    for (int i = 0; i < 4; ++i) {
++        std::uint32_t v = lanes[i];
++        const std::uint32_t e = v & 0x7F800000u;
++        if (!e) v &= 0x80000000u;
++        else if (e == 0x7F800000u) v = (v & 0x80000000u) | 0x7F7FFFFFu;
++        lanes[i] = v;
++    }
++    v4u out;
++    std::memcpy(&out, lanes, 16);
++    return out;
++#endif
+ }
+ PS2_VU_INLINE v4f vin(v4u x) { return (v4f)vfix(x); }
+ PS2_VU_INLINE v4u vout(v4f f) { return vfix((v4u)f); }
+@@ -169,14 +185,30 @@ PS2_VU_INLINE v4u vmin(v4u a, v4u b) {
+ }
+ PS2_VU_INLINE v4u vabs(v4u a) { return a & 0x7FFFFFFFu; }
+ PS2_VU_INLINE v4u vftoi(v4u x, int fraction) {
++#if defined(__clang__)
+     const v4f f = (v4f)vfix(x) * static_cast<float>(1u << fraction);
+     const v4i big = f >= 2147483648.0f;
+     const v4i small = f < -2147483648.0f;
+     const v4i out = big | small;
+     const v4i t = __builtin_convertvector((v4f)((v4i)f & ~out), v4i);
+     return (v4u)((t & ~out) | (big & 0x7FFFFFFF) | (small & (v4i)vsplat(0x80000000u)));
++#else
++    alignas(16) std::uint32_t in[4], out[4];
++    std::memcpy(in, &x, 16);
++    const float scale = static_cast<float>(1u << fraction);
++    for (int i = 0; i < 4; ++i) {
++        const float f = fin(in[i]) * scale;
++        if (f >= 2147483648.0f) out[i] = 0x7FFFFFFFu;
++        else if (f < -2147483648.0f) out[i] = 0x80000000u;
++        else out[i] = static_cast<std::uint32_t>(static_cast<std::int32_t>(f));
++    }
++    v4u r;
++    std::memcpy(&r, out, 16);
++    return r;
++#endif
+ }
+ PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
++#if defined(__clang__)
+     const v4i v = (v4i)x;
+     v4f f = __builtin_convertvector(v, v4f);
+     if (__builtin_reduce_or((v4i)(x + 0x01000000u > 0x02000000u))) {
+@@ -186,6 +218,18 @@ PS2_VU_INLINE v4u vitof(v4u x, int fraction) {
+         f = (v4f)((v4i)f + over);
+     }
+     return (v4u)(f * (1.0f / static_cast<float>(1u << fraction)));
++#else
++    alignas(16) std::uint32_t in[4], out[4];
++    std::memcpy(in, &x, 16);
++    const float inv = 1.0f / static_cast<float>(1u << fraction);
++    for (int i = 0; i < 4; ++i) {
++        const std::int32_t v = static_cast<std::int32_t>(in[i]);
++        out[i] = fout(static_cast<float>(v) * inv);
++    }
++    v4u r;
++    std::memcpy(&r, out, 16);
++    return r;
++#endif
+ }
+ 
+ PS2_VU_INLINE void flags(Vu0Regs &r, const Reg128 &v, unsigned dest) {
+diff --git a/runtime/src/disc.cpp b/runtime/src/disc.cpp
+index 4491f35..b9f7972 100644
+--- a/runtime/src/disc.cpp
++++ b/runtime/src/disc.cpp
+@@ -6,6 +6,16 @@
+ #include <cstring>
+ #include <map>
+ 
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <vector>
++
++#if defined(__SWITCH__)
++#include <switch.h>
++#endif
++
+ namespace ps2::disc {
+ 
+ namespace {
+@@ -17,6 +27,145 @@ std::uint64_t g_size = 0;
+ std::uint32_t g_layer1 = 0;
+ std::map<std::string, Entry> g_index;
+ 
++// NX-2026-11-27-BJ: chunk cache with read-ahead for the disc image file. The game reads the disc
++// in many small pieces (the video screens: about 105 reads of 11 KiB per 60 frames), each one a
++// seek and a read of the SD card on the emulation thread, about 1.8 ms apiece on the Switch.
++// Here the file is read in 256 KiB chunks kept in a small cache; after a read of chunk n a
++// helper thread fetches chunks n + 1 and n + 2, so a stream that is read in order never waits for
++// the card. Data returned is byte for byte what the direct read returned.
++constexpr std::size_t kChunkBytes = 256u * 1024u;
++constexpr int kChunkSlots = 32;  // 8 MiB
++
++struct Chunk {
++    std::uint64_t index = ~0ull;
++    std::size_t got = 0;       // bytes of the chunk present in the file
++    std::uint64_t stamp = 0;   // last use
++    std::unique_ptr<std::uint8_t[]> data;
++};
++
++struct ChunkCache {
++    std::FILE *file = nullptr;
++    std::mutex cache_mutex;  // slots, wanted
++    std::mutex io_mutex;     // the file
++    std::condition_variable wake;
++    Chunk slots[kChunkSlots];
++    std::uint64_t clock = 0;
++    std::uint64_t wanted[2] = {~0ull, ~0ull};
++    std::thread worker;
++    bool started = false;
++
++    static std::size_t read_file(std::FILE *f, std::uint64_t offset, void *out, std::size_t bytes) {
++#if defined(_WIN32)
++        _fseeki64(f, static_cast<long long>(offset), SEEK_SET);
++#else
++        fseeko(f, static_cast<off_t>(offset), SEEK_SET);
++#endif
++        return std::fread(out, 1, bytes, f);
++    }
++
++    // cache_mutex held.
++    Chunk *find(std::uint64_t index) {
++        for (Chunk &c : slots)
++            if (c.index == index) return &c;
++        return nullptr;
++    }
++
++    // cache_mutex held. Puts a loaded chunk into the least recently used slot.
++    void install(std::uint64_t index, std::unique_ptr<std::uint8_t[]> &data, std::size_t got) {
++        if (find(index)) return;
++        Chunk *victim = &slots[0];
++        for (Chunk &c : slots)
++            if (c.stamp < victim->stamp) victim = &c;
++        std::swap(victim->data, data);
++        victim->index = index;
++        victim->got = got;
++        victim->stamp = ++clock;
++    }
++
++    void load(std::uint64_t index) {
++        std::unique_ptr<std::uint8_t[]> data(new std::uint8_t[kChunkBytes]);
++        std::size_t got = 0;
++        {
++            std::lock_guard io(io_mutex);
++            {
++                std::lock_guard lock(cache_mutex);
++                if (find(index)) return;  // loaded while this thread waited for the file
++            }
++            got = read_file(file, index * kChunkBytes, data.get(), kChunkBytes);
++        }
++        std::lock_guard lock(cache_mutex);
++        install(index, data, got);
++    }
++
++    void worker_loop() {
++        for (;;) {
++            std::uint64_t index = ~0ull;
++            {
++                std::unique_lock lock(cache_mutex);
++                wake.wait(lock, [&] { return wanted[0] != ~0ull || wanted[1] != ~0ull; });
++                const int k = wanted[0] != ~0ull ? 0 : 1;
++                index = wanted[k];
++                wanted[k] = ~0ull;
++                if (find(index)) continue;
++            }
++            load(index);
++        }
++    }
++
++    std::size_t read(std::uint64_t offset, void *out, std::size_t bytes) {
++        auto *dst = static_cast<std::uint8_t *>(out);
++        std::size_t done = 0;
++        std::uint64_t last = ~0ull;
++        while (done < bytes) {
++            const std::uint64_t index = (offset + done) / kChunkBytes;
++            const std::size_t at = static_cast<std::size_t>((offset + done) % kChunkBytes);
++            bool hit = false, end = false;
++            {
++                std::lock_guard lock(cache_mutex);
++                if (Chunk *c = find(index)) {
++                    c->stamp = ++clock;
++                    const std::size_t n = c->got > at ? std::min(bytes - done, c->got - at) : 0;
++                    std::memcpy(dst + done, c->data.get() + at, n);
++                    done += n;
++                    hit = true;
++                    end = c->got < kChunkBytes && at + n >= c->got;  // end of the file
++                }
++            }
++            if (!hit) {
++                load(index);
++                continue;
++            }
++            last = index;
++            if (end) break;
++        }
++        if (last != ~0ull) {
++            std::lock_guard lock(cache_mutex);
++            wanted[0] = find(last + 1) ? ~0ull : last + 1;
++            wanted[1] = find(last + 2) ? ~0ull : last + 2;
++            if (!started) {
++                started = true;
++#if defined(__SWITCH__)
++                // NX-2026-11-27-BK: a libnx thread, like the GS and VU threads. Build BJ used
++                // std::thread with detach() here and crashed at boot in other threads as they woke
++                // from timed waits (two crash reports, one in the VU thread, one in the GS thread).
++                // Cause not proven; the detached std::thread is the only thread made that way.
++                static Thread nx_thread;
++                if (R_SUCCEEDED(threadCreate(&nx_thread, [](void *self) { static_cast<ChunkCache *>(self)->worker_loop(); },
++                                             this, nullptr, 0x40000, 0x2C, -2)))
++                    threadStart(&nx_thread);
++#else
++                worker = std::thread([this] { worker_loop(); });
++                worker.detach();
++#endif
++            }
++            if (wanted[0] != ~0ull || wanted[1] != ~0ull) wake.notify_one();
++        }
++        return done;
++    }
++};
++
++ChunkCache *g_chunks = nullptr;
++
+ std::uint32_t u32(const std::uint8_t *p) {
+     std::uint32_t v;
+     std::memcpy(&v, p, 4);
+@@ -72,15 +221,23 @@ bool open(const std::string &path) {
+     fseeko(g_file, 0, SEEK_END);
+     const std::uint64_t size = static_cast<std::uint64_t>(ftello(g_file));
+ #endif
+-    std::FILE *file = g_file;
+-    return open(path, size, [file](std::uint64_t offset, void *out, std::size_t bytes) {
+-#if defined(_WIN32)
+-        _fseeki64(file, static_cast<long long>(offset), SEEK_SET);
+-#else
+-        fseeko(file, static_cast<off_t>(offset), SEEK_SET);
+-#endif
+-        return std::fread(out, 1, bytes, file);
+-    });
++    // NX-2026-11-27-BK: an empty file `disccache.off` next to the disc image keeps the direct reads.
++    {
++        const auto slash = path.find_last_of("/\\");
++        const std::string off = (slash == std::string::npos ? std::string() : path.substr(0, slash + 1)) + "disccache.off";
++        if (std::FILE *f = std::fopen(off.c_str(), "rb")) {
++            std::fclose(f);
++            std::fprintf(stderr, "[disc] disccache.off found: direct reads\n");
++            std::FILE *file = g_file;
++            return open(path, size, [file](std::uint64_t offset, void *out, std::size_t bytes) {
++                return ChunkCache::read_file(file, offset, out, bytes);
++            });
++        }
++    }
++    // NX-2026-11-27-BJ: through the chunk cache (never freed: lives as long as the process).
++    g_chunks = new ChunkCache;
++    g_chunks->file = g_file;
++    return open(path, size, [](std::uint64_t offset, void *out, std::size_t bytes) { return g_chunks->read(offset, out, bytes); });
+ }
+ 
+ bool open(const std::string &name, std::uint64_t size, Reader reader, Probe probe) {
+diff --git a/runtime/src/dmac.cpp b/runtime/src/dmac.cpp
+index 50c5f37..c329b54 100644
+--- a/runtime/src/dmac.cpp
++++ b/runtime/src/dmac.cpp
+@@ -305,6 +305,66 @@ bool ipu_push(const std::uint8_t *qword) {
+     return true;
+ }
+ 
++// NX-2026-11-27-BW: the IPU moved its data one qword per call: 24 calls in and 64 out for every
++// macroblock of a colour conversion, about 100,000 calls per video frame (run BV, video menus:
++// 5.7 ms per frame inside DMAC register writes, most of it this). All but the last qword of the
++// current block of a transfer are plain copies with no side effect, so they are copied at once;
++// the last one, and everything a block boundary does (next tag, end of transfer, interrupt), still
++// goes through the single-qword function.
++namespace {
++std::size_t contiguous_qwords(std::uint32_t address) {
++    const std::size_t room = (address & 0x80000000u) ? kScratchpadSize - (address & (kScratchpadSize - 1))
++                                                     : kRamSize - (address & (kRamSize - 16));
++    return room / 16;
++}
++}  // namespace
++
++std::size_t ipu_pull_n(std::uint8_t *qwords, std::size_t n) {
++    std::size_t got = 0;
++    while (got < n) {
++        Channel &c = g_ch[4];
++        if ((c.chcr & 0x100u) && c.qwc > 1u) {
++            std::size_t k = n - got;
++            if (k > c.qwc - 1u) k = c.qwc - 1u;
++            const std::size_t room = contiguous_qwords(c.madr);
++            if (k > room) k = room;
++            if (k > 1) {
++                std::memcpy(qwords + got * 16, source(c.madr), k * 16);
++                c.madr += static_cast<std::uint32_t>(k * 16);
++                c.qwc -= static_cast<std::uint32_t>(k);
++                got += k;
++                continue;
++            }
++        }
++        if (!ipu_pull(qwords + got * 16)) break;
++        ++got;
++    }
++    return got;
++}
++
++std::size_t ipu_push_n(const std::uint8_t *qwords, std::size_t n) {
++    std::size_t done = 0;
++    while (done < n) {
++        Channel &c = g_ch[3];
++        if ((c.chcr & 0x100u) && c.qwc > 1u) {
++            std::size_t k = n - done;
++            if (k > c.qwc - 1u) k = c.qwc - 1u;
++            const std::size_t room = contiguous_qwords(c.madr);
++            if (k > room) k = room;
++            if (k > 1) {
++                std::memcpy(target(c.madr), qwords + done * 16, k * 16);
++                c.madr += static_cast<std::uint32_t>(k * 16);
++                c.qwc -= static_cast<std::uint32_t>(k);
++                done += k;
++                continue;
++            }
++        }
++        if (!ipu_push(qwords + done * 16)) break;
++        ++done;
++    }
++    return done;
++}
++
+ void reset() {
+     for (Channel &c : g_ch) c = Channel{};
+     g_ctrl = g_pcr = g_sqwc = g_rbsr = g_rbor = g_stadr = g_enable = 0;
+diff --git a/runtime/src/dmac.hpp b/runtime/src/dmac.hpp
+index 4ceb9e7..759710b 100644
+--- a/runtime/src/dmac.hpp
++++ b/runtime/src/dmac.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace ps2::state {
+@@ -18,5 +19,9 @@ void write(std::uint32_t a, std::uint32_t v);
+ void resume(int ch);
+ bool ipu_pull(std::uint8_t *qword);
+ bool ipu_push(const std::uint8_t *qword);
++// NX-2026-11-27-BW: up to `n` qwords in one call; the result is how many moved. Same effect as that
++// many calls of the functions above.
++std::size_t ipu_pull_n(std::uint8_t *qwords, std::size_t n);
++std::size_t ipu_push_n(const std::uint8_t *qwords, std::size_t n);
+ 
+ }
+diff --git a/runtime/src/iop/cdvd.cpp b/runtime/src/iop/cdvd.cpp
+index 218cbda..e91069a 100644
+--- a/runtime/src/iop/cdvd.cpp
++++ b/runtime/src/iop/cdvd.cpp
+@@ -1,3 +1,5 @@
++#include <cstring>
++#include <chrono>
+ #include "kernel.hpp"
+ 
+ #include "ps2/disc.hpp"
+@@ -51,6 +53,14 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer,
+ 
+ }
+ 
++// NX-2026-11-27-AZ: disc read totals for the Switch perf log ([sys] line): nanoseconds spent in
++// disc::read, bytes read, number of reads.
++extern "C" {
++unsigned long long gt4_disc_read_ns = 0;
++unsigned long long gt4_disc_read_bytes = 0;
++unsigned long long gt4_disc_reads = 0;
++}
++
+ std::vector<std::uint8_t> read_disc_file(const std::string &path) {
+     const auto entry = disc::find(path);
+     if (!entry || entry->directory) return {};
+@@ -66,6 +76,16 @@ bool start_read(std::uint32_t lsn, std::uint32_t sectors, std::uint32_t buffer,
+     if (g_cd.busy) return false;
+     g_cd.busy = true;
+     g_cd.error = 0;
++    // NX-2026-11-27-AK: disc activity trace (every 100th read) so a log shows whether a black screen is
++    // still loading or the game stopped asking for data.
++    {
++        static std::uint64_t reads = 0, total_sectors = 0;
++        ++reads;
++        total_sectors += sectors;
++        if (reads % 100u == 1u)
++            std::fprintf(stderr, "[cdvd] reads=%llu sectors=%llu last lsn=%u count=%u\n",
++                         static_cast<unsigned long long>(reads), static_cast<unsigned long long>(total_sectors), lsn, sectors);
++    }
+     disc::ready(lsn, sectors);
+     schedule(now() + read_cycles(sectors), Job{kJobCdRead, lsn, sectors, buffer});
+     return true;
+@@ -81,8 +101,19 @@ void install_cdvd() {
+             return;
+         }
+         std::vector<std::uint8_t> data(static_cast<std::size_t>(j.b) * disc::kSector);
++        const auto disc_t0 = std::chrono::steady_clock::now();
+         disc::read(j.a, j.b, data.data());
+-        for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
++        gt4_disc_read_ns += static_cast<unsigned long long>(
++            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - disc_t0).count());
++        gt4_disc_read_bytes += data.size();
++        ++gt4_disc_reads;
++        // NX-2026-11-27-BJ: one copy when the whole destination is IOP RAM (it was one checked
++        // write per byte, about 1.5 million calls per second of video).
++        if (phys(j.c) < kRamSize && static_cast<std::uint64_t>(phys(j.c)) + data.size() <= kRamSize) {
++            std::memcpy(ram_ptr(j.c), data.data(), data.size());
++        } else {
++            for (std::size_t i = 0; i < data.size(); ++i) write8(j.c + static_cast<std::uint32_t>(i), data[i]);
++        }
+         finish_read();
+     });
+     register_hle_library("cdvdman", 0x0101);
+diff --git a/runtime/src/ipu/ipu.cpp b/runtime/src/ipu/ipu.cpp
+index 4e5a1a1..1aa2dc6 100644
+--- a/runtime/src/ipu/ipu.cpp
++++ b/runtime/src/ipu/ipu.cpp
+@@ -135,7 +135,13 @@ std::uint32_t bits_at(std::size_t bit, unsigned n) {
+     if (!n) return 0;
+     std::uint64_t v = 0;
+     const std::size_t byte = bit >> 3;
+-    for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
++    // NX-2026-11-27-BG: eight bytes in one load when they are all there (same value as the loop).
++    if (byte + 8 <= g_in.size()) {
++        std::memcpy(&v, g_in.data() + byte, 8);
++        v = __builtin_bswap64(v);
++    } else {
++        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
++    }
+     return static_cast<std::uint32_t>((v << (bit & 7u)) >> (64 - n));
+ }
+ 
+@@ -232,19 +238,51 @@ bool read_coefficient(const DctLookup &l, int &run, int &level) {
+ 
+ void idct(const int *in, std::int16_t *out) {
+     const auto &c = tables().cosines;
++    // NX-2026-11-27-BG: the same sums in the same order, without the terms that are exactly zero.
++    // A decoded block has a handful of non-zero coefficients; the full form did 1024 double
++    // multiply-adds for every block. (Written as the suspected cause of the 30 to 40 ms of ee_ms
++    // per frame on the video menu screens; Switch run BG showed no change there, so that time is
++    // elsewhere.)
++    // Adding c * 0 leaves a sum unchanged, so every output value is identical.
++    // Per-x accumulators instead of one sum at a time: each output still adds its terms in the
++    // original order (u, then v, ascending), the eight sums of a row just advance together.
+     double rows[8][8];
+-    for (int v = 0; v < 8; ++v)
+-        for (int x = 0; x < 8; ++x) {
+-            double s = 0;
+-            for (int u = 0; u < 8; ++u) s += c[x][u] * in[v * 8 + u];
+-            rows[v][x] = s;
++    int row_list[8];
++    int row_count = 0;
++    for (int v = 0; v < 8; ++v) {
++        int cu[8];
++        double cv[8];
++        int n = 0;
++        for (int u = 0; u < 8; ++u)
++            if (in[v * 8 + u]) {
++                cu[n] = u;
++                cv[n] = in[v * 8 + u];
++                ++n;
++            }
++        if (!n) continue;
++        row_list[row_count++] = v;
++        double acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        for (int k = 0; k < n; ++k) {
++            const int u = cu[k];
++            const double val = cv[k];
++            for (int x = 0; x < 8; ++x) acc[x] += c[x][u] * val;
+         }
+-    for (int y = 0; y < 8; ++y)
+-        for (int x = 0; x < 8; ++x) {
+-            double s = 0;
+-            for (int v = 0; v < 8; ++v) s += c[y][v] * rows[v][x];
+-            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s + 0.5)), -256, 255));
++        for (int x = 0; x < 8; ++x) rows[v][x] = acc[x];
++    }
++    if (!row_count) {
++        for (int i = 0; i < 64; ++i) out[i] = 0;
++        return;
++    }
++    for (int y = 0; y < 8; ++y) {
++        double acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
++        for (int k = 0; k < row_count; ++k) {
++            const int v = row_list[k];
++            const double w = c[y][v];
++            for (int x = 0; x < 8; ++x) acc[x] += w * rows[v][x];
+         }
++        for (int x = 0; x < 8; ++x)
++            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(acc[x] + 0.5)), -256, 255));
++    }
+ }
+ 
+ void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {
+@@ -461,6 +499,11 @@ bool run_command() {
+         return true;
+     }
+     case kVdec: {
++        // NX-2026-11-27-BL: as for FDEC, for the skipped bits.
++        if (!have(cmd & 0x3Fu)) {
++            ++g_stalls;
++            return false;
++        }
+         const bool ok = atomic([&] {
+             skip(cmd & 0x3Fu);
+             const Lookup *table = nullptr;
+@@ -483,6 +526,13 @@ bool run_command() {
+         return ok;
+     }
+     case kFdec: {
++        // NX-2026-11-27-BL: the same stall without a C++ exception (a throw costs several
++        // microseconds on the Switch). have() pulls exactly what skip() and peek() would have
++        // pulled before giving up, and nothing else is changed by a stalled FDEC.
++        if (!have((cmd & 0x3Fu) + 32u)) {
++            ++g_stalls;
++            return false;
++        }
+         const bool ok = atomic([&] {
+             skip(cmd & 0x3Fu);
+             g_result = peek(32);
+@@ -535,6 +585,31 @@ bool run_command() {
+     }
+ }
+ 
++}  // namespace
++}  // namespace ps2::ipu
++
++// NX-2026-11-27-BL: host time inside a command write (IPU_CMD), split by step, for the Switch perf
++// log. Index: 0 whole write, 1 run_command, 2 drain, 3 top_up. Calls by command code in
++// gt4_ipu_cmds[16]. Run BK: 33,000 command writes per frame on the intro video at 450 ns each.
++extern "C" {
++unsigned long long gt4_ipu_ticks[4] = {};
++unsigned long long gt4_ipu_cmds[16] = {};
++unsigned long long gt4_ipu_stalls = 0;  // commands that ran out of stream (total)
++}
++
++namespace ps2::ipu {
++namespace {
++
++inline unsigned long long prof_tick() {
++#if defined(__aarch64__)
++    unsigned long long v;
++    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
++    return v;
++#else
++    return 0;
++#endif
++}
++
+ void drain() {
+     while (g_out_pos + 16 <= g_out.size() && dmac::ipu_push(g_out.data() + g_out_pos)) {
+         g_out_pos += 16;
+@@ -547,6 +622,7 @@ void drain() {
+ }
+ 
+ void step() {
++    const unsigned long long t0 = prof_tick();
+     if (g_busy && g_decoding) {
+         try {
+             g_starved = !run_command();
+@@ -558,12 +634,19 @@ void step() {
+             g_busy = false;
+         }
+     }
++    const unsigned long long t1 = prof_tick();
+     drain();
+     if (g_busy && !g_decoding && g_out.empty()) {
+         g_busy = false;
+         if (g_interrupt) hw::intc_raise(8);
+     }
++    const unsigned long long t2 = prof_tick();
+     top_up();
++    const unsigned long long t3 = prof_tick();
++    gt4_ipu_ticks[1] += t1 - t0;
++    gt4_ipu_ticks[2] += t2 - t1;
++    gt4_ipu_ticks[3] += t3 - t2;
++    gt4_ipu_stalls = g_stalls;
+ }
+ 
+ }
+@@ -617,6 +700,13 @@ void write32(std::uint32_t a, std::uint32_t v) {
+     switch (a) {
+     case 0x10002000u: {
+     }
++    {
++        const unsigned long long cmd_t0 = prof_tick();
++        ++gt4_ipu_cmds[v >> 28];
++        struct CmdTimer {
++            unsigned long long t0;
++            ~CmdTimer() { gt4_ipu_ticks[0] += prof_tick() - t0; }
++        } cmd_timer{cmd_t0};
+         g_ctrl &= ~(kEcd | kScd);
+         g_starved = false;
+         ++g_commands[v >> 28];
+@@ -635,6 +725,7 @@ void write32(std::uint32_t a, std::uint32_t v) {
+                 std::fprintf(stderr, "[ipu] cmd 0x%08X -> result %08X ctrl %08X bit %zu next %08X%08X\n", v, g_result, g_ctrl, g_bit,
+                              bits_at(g_bit, 32), bits_at(g_bit + 32, 32));
+         }
++    }
+         break;
+     case 0x10002010u:
+         if (v & kReset) {
+diff --git a/runtime/src/kernel.cpp b/runtime/src/kernel.cpp
+index a8a6b4d..0b5776f 100644
+--- a/runtime/src/kernel.cpp
++++ b/runtime/src/kernel.cpp
+@@ -430,7 +430,32 @@ void service(Cpu &c) {
+     c.pc &= ~kUnwind;
+ }
+ 
++// NX-2026-11-27-AL: kernel activity trace. Every 300 vblanks one line with the syscalls made since the
++// last line (number:count, the 14 most frequent; numbers >= 0x100 are the interrupt-context variants),
++// the interrupt mask and status, and the GS CSR / IMR. It shows what the game still does while the
++// screen is black and every thread sleeps (race start).
++std::uint32_t g_sys_hist[0x200] = {};
++std::uint32_t g_sys_vblanks = 0;
++
++void sys_trace_vblank() {
++    if (++g_sys_vblanks % 300u != 0u) return;
++    std::fprintf(stderr, "[kern] vblank %u intc mask=%04X stat=%04X csr=%08llX imr=%04llX threads=%zu sys:", g_sys_vblanks,
++                 hw::read32(0x1000F010u), hw::read32(0x1000F000u), static_cast<unsigned long long>(hw::gs_csr()),
++                 static_cast<unsigned long long>(hw::gs_imr()), g_threads.size());
++    for (int shown = 0; shown < 14; ++shown) {
++        std::uint32_t best = 0;
++        for (std::uint32_t i = 1; i < 0x200u; ++i)
++            if (g_sys_hist[i] > g_sys_hist[best]) best = i;
++        if (g_sys_hist[best] == 0) break;
++        std::fprintf(stderr, " %s%s:%u", best >= 0x100u ? "i" : "", syscall_name(best & 0xFFu), g_sys_hist[best]);
++        g_sys_hist[best] = 0;
++    }
++    std::fprintf(stderr, "\n");
++    for (std::uint32_t &h : g_sys_hist) h = 0;
++}
++
+ void on_vblank_start() {
++    sys_trace_vblank();
+     if (!g_vsync_flag) return;
+     st32(g_vsync_flag, 1);
+     if (g_vsync_data) st64(g_vsync_data, hw::gs_csr());
+@@ -467,6 +492,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
+             return;
+         }
+     }
++    if (n < 0x100u) ++g_sys_hist[n + (interrupt_variant ? 0x100u : 0u)];
+     if (g_options.trace_syscalls)
+         std::fprintf(stderr, "[sys] %s(0x%02X) %08X %08X %08X %08X from 0x%08X thread %d\n",
+                      syscall_name(n), n, arg(c, 0), arg(c, 1), arg(c, 2), arg(c, 3), pc, g_current);
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+index 7d3e198..027b14c 100644
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -95,24 +95,73 @@ std::uint32_t physical(std::uint32_t a) {
+     return a;
+ }
+ 
+-std::uint8_t slow_ld8(std::uint32_t a) { return read_slow<std::uint8_t>(a); }
+-std::uint16_t slow_ld16(std::uint32_t a) { return read_slow<std::uint16_t>(a); }
+-std::uint32_t slow_ld32(std::uint32_t a) { return read_slow<std::uint32_t>(a); }
+-std::uint64_t slow_ld64(std::uint32_t a) { return read_slow<std::uint64_t>(a); }
++// NX-2026-11-27-BH: calls and host time of the EE memory slow path (everything that is not main
++// RAM or the scratchpad: hardware registers, IPU, DMAC, GS, VU memory). Read by the Switch perf
++// log to tell translated-code time from device time inside ee_ms.
++extern "C" {
++unsigned long long gt4_ee_slow_calls = 0;
++unsigned long long gt4_ee_slow_ticks = 0;
++unsigned long long gt4_ee_io_calls[40] = {};
++unsigned long long gt4_ee_io_ticks[40] = {};
++}
++namespace {
++inline unsigned long long slow_tick() {
++#if defined(__aarch64__)
++    unsigned long long v;
++    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(v));
++    return v;
++#else
++    return 0;
++#endif
++}
++// NX-2026-11-27-BI: the same, split by device. Buckets 0-15: reads of the IPU registers
++// 0x10002000 + 4 * n; 16-31: writes of them; 32 IPU FIFO, 33 DMAC, 34 GIF / VIF registers,
++// 35 GS privileged, 36 timers, 37 INTC / SIF / other 0x1000Fxxx, 38 VU memory, 39 anything else.
++struct SlowScope {
++    unsigned long long t0 = slow_tick();
++    int bucket;
++    SlowScope(std::uint32_t a, bool write) {
++        const std::uint32_t p = (a >= 0x80000000u && a < 0xC0000000u) ? (a & 0x1FFFFFFFu) : a;
++        if ((p & 0xFFFFFFC0u) == 0x10002000u) bucket = static_cast<int>((p & 0x3Cu) >> 2) + (write ? 16 : 0);
++        else if (p >= 0x10007000u && p < 0x10007020u) bucket = 32;
++        else if (p >= 0x10008000u && p < 0x1000F000u) bucket = 33;
++        else if (p >= 0x10003000u && p < 0x10007000u) bucket = 34;
++        else if (p >= 0x12000000u && p < 0x12002000u) bucket = 35;
++        else if (p >= 0x10000000u && p < 0x10002000u) bucket = 36;
++        else if (p >= 0x1000F000u && p < 0x10010000u) bucket = 37;
++        else if (p >= 0x11000000u && p < 0x11010000u) bucket = 38;
++        else bucket = 39;
++    }
++    ~SlowScope() {
++        const unsigned long long dt = slow_tick() - t0;
++        gt4_ee_slow_ticks += dt;
++        ++gt4_ee_slow_calls;
++        gt4_ee_io_ticks[bucket] += dt;
++        ++gt4_ee_io_calls[bucket];
++    }
++};
++}  // namespace
++
++std::uint8_t slow_ld8(std::uint32_t a) { SlowScope scope(a, false); return read_slow<std::uint8_t>(a); }
++std::uint16_t slow_ld16(std::uint32_t a) { SlowScope scope(a, false); return read_slow<std::uint16_t>(a); }
++std::uint32_t slow_ld32(std::uint32_t a) { SlowScope scope(a, false); return read_slow<std::uint32_t>(a); }
++std::uint64_t slow_ld64(std::uint32_t a) { SlowScope scope(a, false); return read_slow<std::uint64_t>(a); }
+ 
+ void slow_ld128(std::uint32_t a, Reg128 &out) {
++    SlowScope scope(a, false);
+     const Target t = resolve(a);
+     if (t.host) std::memcpy(&out, t.host, 16);
+     else if (t.region == Region::Io) hw::read128(t.address, out);
+     else std::memset(&out, 0, 16);
+ }
+ 
+-void slow_st8(std::uint32_t a, std::uint8_t v) { write_slow(a, v); }
+-void slow_st16(std::uint32_t a, std::uint16_t v) { write_slow(a, v); }
+-void slow_st32(std::uint32_t a, std::uint32_t v) { write_slow(a, v); }
+-void slow_st64(std::uint32_t a, std::uint64_t v) { write_slow(a, v); }
++void slow_st8(std::uint32_t a, std::uint8_t v) { SlowScope scope(a, true); write_slow(a, v); }
++void slow_st16(std::uint32_t a, std::uint16_t v) { SlowScope scope(a, true); write_slow(a, v); }
++void slow_st32(std::uint32_t a, std::uint32_t v) { SlowScope scope(a, true); write_slow(a, v); }
++void slow_st64(std::uint32_t a, std::uint64_t v) { SlowScope scope(a, true); write_slow(a, v); }
+ 
+ void slow_st128(std::uint32_t a, const Reg128 &v) {
++    SlowScope scope(a, true);
+     const Target t = resolve(a);
+     if (t.host) std::memcpy(t.host, &v, 16);
+     else if (t.region == Region::Io) hw::write128(t.address, v);
+diff --git a/runtime/src/system.cpp b/runtime/src/system.cpp
+index ca8f06c..a206b38 100644
+--- a/runtime/src/system.cpp
++++ b/runtime/src/system.cpp
+@@ -363,10 +363,21 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
+     schedule(hw::kEventVblank, frame_cycles(), vblank);
+ }
+ 
++extern "C" {
++unsigned long long gt4_ee_dispatches = 0;
++unsigned long long gt4_ee_cycles = 0;
++}
++
+ int run() {
+     Cpu &c = g_cpu;
+     if (!g_resumed) set_budget(c, kMaxSlice);
++    std::uint64_t dispatch_t0 = 0;
++    bool dispatched = false;
+     while (!g_halted) {
++        if (dispatched) {
++            gt4_ee_cycles += now() - dispatch_t0;
++            dispatched = false;
++        }
+         if (g_state_request) {
+             g_state_request = false;
+             save_state(g_options.save_state_path);
+@@ -380,6 +391,11 @@ int run() {
+             continue;
+         }
+         if (c.budget <= 0) refill(c);
++        // NX-2026-11-27-BH: entries into translated code; the guest cycles it ran are added at
++        // the top of the next pass (the Switch build's patch script needs the call left as is).
++        dispatch_t0 = now();
++        dispatched = true;
++        ++gt4_ee_dispatches;
+         dispatch(c, 0, 0);
+     }
+     kernel::dump();
+@@ -427,6 +443,20 @@ std::atomic<double> g_vu_idle_ms{0.0};
+ double vu_thread_idle_ms() { return g_vu_idle_ms.load(); }
+ std::uint64_t vu1_interpreted_calls() { return vu::interpreted_calls(); }
+ 
++#if defined(__SWITCH__)
++extern "C" {
++// Defined in switch/source/coregs_nx.cpp.
++void gt4_switch_vu_forward(std::uint32_t type, std::uint32_t arg0, std::uint32_t arg1, const std::uint8_t *payload,
++                           std::uint32_t bytes);
++// NX-2026-11-27-BF: for coregs_nx.cpp (it cannot include the queue header).
++void gt4_switch_vu_post(std::uint32_t type, std::uint32_t arg0, std::uint32_t arg1, const void *data, std::uint32_t bytes) {
++    gs::queue::vu().post(static_cast<gs::queue::Type>(type), arg0, arg1, data, bytes);
++}
++int gt4_switch_on_vu_thread() { return gs::queue::role() == gs::queue::Role::Vu ? 1 : 0; }
++int gt4_switch_vu_active() { return gs::queue::vu_active() ? 1 : 0; }
++}
++#endif
++
+ void run_vu_thread() {
+     gs::queue::role() = gs::queue::Role::Vu;
+     gs::queue::Ring &in = gs::queue::vu();
+@@ -445,7 +475,14 @@ void run_vu_thread() {
+                 g_vu_fence.fetch_add(1);
+                 gs::queue::notify(g_vu_fence);
+                 break;
++#if defined(__SWITCH__)
++            // NX-2026-11-27-BF: the Switch build has no donor render ring; everything the main thread
++            // sends to the GS travels through this ring (so it stays in order with the packets VU1
++            // emits) and is handed to the CoreGS queue here.
++            default: gt4_switch_vu_forward(h.type, h.arg0, h.arg1, payload, h.bytes); break;
++#else
+             default: gs::queue::render().post(static_cast<gs::queue::Type>(h.type), h.arg0, h.arg1, payload, h.bytes); break;
++#endif
+             }
+             in.pop(h);
+         }

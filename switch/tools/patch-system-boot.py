@@ -22,6 +22,15 @@ INJECT = """void boot(std::uint32_t entry, const std::vector<std::string> &args)
 #endif
 """
 
+PERF_SCOPES = [
+    ("        iop::run(t - g_iop_synced);\n",
+     "        gt4::perf::Scope perf_iop(gt4::perf::kIop);\n        iop::run(t - g_iop_synced);\n"),
+    ("    sif::pump();\n",
+     "    { gt4::perf::Scope perf_sif(gt4::perf::kIop); sif::pump(); }\n"),
+    ("        dispatch(c, 0, 0);\n    }\n    kernel::dump();",
+     "        { gt4::perf::Scope perf_ee(gt4::perf::kEe); dispatch(c, 0, 0); }\n    }\n    kernel::dump();"),
+]
+
 
 def main() -> int:
     if len(sys.argv) != 3:
@@ -40,6 +49,13 @@ def main() -> int:
     if marker not in out:
         print("inject failed", file=sys.stderr)
         return 1
+    # NX-2026-11-27-T: EE / IOP time slots for perf.log (were always 0).
+    for old, new in PERF_SCOPES:
+        if out.count(old) != 1:
+            print("perf needle not found:", old.strip(), file=sys.stderr)
+            return 1
+        out = out.replace(old, new, 1)
+    out = '#include "perf_nx.hpp"\n' + out
     pathlib.Path(sys.argv[2]).write_text(out, encoding="utf-8")
     print("patched", sys.argv[2])
     return 0

@@ -59,6 +59,11 @@ display::Image ReadCircuit(const memory::LocalMemory& local, const display::Circ
 
 CpuRenderer::CpuRenderer() : frontEnd_(FrontEndOptions{}, *this, *this, memory_) {
     frontEnd_.SetLocalMemory(memory_.Local().bytes().data());
+    // NX-2026-11-27-AS: palette loads read local memory directly. Without this the Switch GPU drawer was
+    // never asked to write its pixels back first. GT4's race colour correction keeps its work pixels in a
+    // render target and loads them as a palette right after drawing them: the first load of every 64x32
+    // page read the previous page's data (one wrong 8-pixel column per page on screen).
+    frontEnd_.SetBeforeLocalRead([this](const BlockRange& range) { memory_.NotifyRead(range.begin, range.count); });
 }
 
 bool CpuRenderer::GifTransfer(uint32_t path, const std::vector<uint8_t>& bytes) {

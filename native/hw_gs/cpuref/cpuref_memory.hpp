@@ -45,6 +45,11 @@ public:
     // outside local memory (the Switch GPU writeback) uses it to write them back first.
     using AccessHook = std::function<void(uint32_t block, uint32_t blocks, bool write)>;
     void SetAccessHook(AccessHook hook) { accessHook_ = std::move(hook); }
+    // NX-2026-11-27-AS: a read of local memory that is not a transfer (a palette load). Same hook, so a
+    // drawer that keeps pixels on the GPU writes them back before the read.
+    void NotifyRead(uint32_t block, uint32_t blocks) {
+        if (accessHook_) accessHook_(block, blocks, false);
+    }
 
     // Counters for the replay summary.
     uint64_t uploadCount = 0;
@@ -52,7 +57,9 @@ public:
     uint64_t readCount = 0;
 
 private:
-    void NotifyAccess(uint32_t block, uint32_t widthUnits, uint32_t rows, bool write);
+    void NotifyAccess(uint32_t block, uint32_t widthUnits, uint32_t rows, bool write, uint32_t psm);
+    // NX-2026-11-27-BE: a write of the pixel rectangle (x, y, w, h) of a buffer.
+    void NotifyWrite(uint32_t block, uint32_t widthUnits, uint32_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
     memory::LocalMemory local_;
     AccessHook accessHook_;

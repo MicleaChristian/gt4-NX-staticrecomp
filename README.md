@@ -31,14 +31,30 @@ The Switch work lives on the branch
 
 ## Where it stands
 
-Measured on a first-model Switch, handheld, stock clock:
+### Progress to 1.0
 
-| Screen | Speed today | Target |
-|---|---|---|
-| Car manufacturer menu | 50 to 60 FPS | 60 |
-| Menus with video behind them | 20 to 30 FPS | 60 |
-| Car select | about 11 FPS | 60 |
-| Race | 8 to 20 FPS | 60 |
+**1.0 means a locked 60 FPS on every screen, on a first-model Switch at the stock clock (no overclock).**
+
+![Progress to 1.0](https://img.shields.io/badge/progress%20to%201.0-43%25-d29922?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-0.2.0-1f6feb?style=for-the-badge)
+
+```
+0.2.0  [#################.......................]  43%  ->  1.0 (60 FPS, stock clock)
+```
+
+| Reference screen | Speed in 0.2.0 | Target | Share of target |
+|---|---|---|---|
+| Car manufacturer menu | 55 FPS | 60 | 92% |
+| Menus with video behind them | 25 FPS | 60 | 42% |
+| Car select | 11 FPS | 60 | 18% |
+| Race (Nürburgring, 6 cars) | 12 FPS | 60 | 20% |
+| **Overall** | | | **43%** |
+
+How the number is made: each screen's average speed divided by 60, capped at 100%, then the plain average of the four
+screens. Speeds are 15-second averages from the built-in logs, measured on a first-model Switch, handheld, stock clock
+(CPU 1020 MHz, GPU 307 MHz), on 2026-11-27. The number only moves when a measured run moves it.
+
+With the console overclocked (CPU 1785 MHz) the race runs at about 20 FPS; that does not count toward 1.0.
 
 What already works:
 

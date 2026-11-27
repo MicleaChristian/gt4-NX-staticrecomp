@@ -77,7 +77,7 @@ $(BUILD)/rt_dispatch.o: $(RUNTIME_SRC)/dispatch.cpp | $(BUILD)
 $(BUILD)/system_nx.cpp: $(RUNTIME_SRC)/system.cpp $(TOOLS_DIR)/patch-system-boot.py | $(BUILD)
 	@python "$(TOOLS_DIR)/patch-system-boot.py" "$<" "$@"
 
-$(BUILD)/rt_system.o: $(BUILD)/system_nx.cpp | $(BUILD)
+$(BUILD)/rt_system.o: $(BUILD)/system_nx.cpp include/perf_nx.hpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -I"$(RUNTIME_SRC)" -c "$<" -o "$@"
 $(BUILD)/rt_kernel.o: $(RUNTIME_SRC)/kernel.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS_RT) -c "$<" -o "$@"

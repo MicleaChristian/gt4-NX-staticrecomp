@@ -19,6 +19,8 @@
 #include <memory>
 #include <vector>
 
+#include <switch.h>
+
 namespace gt4::hw {
 namespace {
 
@@ -49,9 +51,25 @@ struct Backend::Impl {
   ScanoutRequest last_scanout{}; // packed RGBA8 of last_frame, reused by present_slot
   std::uint64_t present_frames = 0;
   std::uint64_t field_holds = 0; // interlaced FFMD: odd vblanks re-show the previous field
+  // Zero-copy present: the deko swapchain shares dk.device; scanout blits on the GPU.
+  bool gpu_present = false;
+  bool allow_direct = false; // set by end_frame only (other scanout callers want pixels)
+  bool last_direct = false;  // last end_frame frame went out through the GPU blit
+  // NX-2026-11-27-U: real displayed-frame counters (perf.log fps is guest vblank rate only).
+  std::uint32_t disp_fbp = 0xFFFFFFFFu;  // DISPFB fbp of the circuit scanned out this present
+  std::uint32_t last_disp_fbp = 0xFFFFFFFFu;
+  std::uint64_t disp_flips = 0;          // presents whose DISPFB fbp differs from the previous one
+  std::uint64_t draw_presents = 0;       // presents with new GPU draws since the previous present
+  std::uint64_t last_draws = 0;
+  std::uint64_t win_flips = 0, win_draw_presents = 0, win_presents = 0;
+  std::uint64_t win_start_tick = 0;
 
   void shutdown() {
     if (writeback.ready()) writeback.report(stderr);
+    if (gpu_present) {
+      gt4::platform::nx::deko3d_present_detach_gpu();
+      gpu_present = false;
+    }
     writeback.shutdown();
     hwgs::dk::destroy_device(dk);
     cpu.reset();
@@ -231,27 +249,138 @@ bool Backend::scanout(ScanoutRequest &request) {
   hwgs::display::PmodeFields pmode{};
   if (!impl_->cpu->PeekDisplay(layout, pmode)) return false;
 
+  // NX-2026-11-13-G: once per 60 peeks — greppable DISPFB vs circuit enable (FMV vs UI hypothesis).
+  {
+    static std::uint64_t dispfb_diag_n = 0;
+    if ((++dispfb_diag_n == 1u) || (dispfb_diag_n % 60u == 0u)) {
+      const auto &c0 = layout.circuits[0];
+      const auto &c1 = layout.circuits[1];
+      std::fprintf(stderr,
+                   "[hw-dk] dispfb-diag: c0 en=%d fbp=%u fbw=%u psm=%u rw=%u rh=%u | "
+                   "c1 en=%d fbp=%u fbw=%u psm=%u rw=%u rh=%u | pmode en1=%d en2=%d\n",
+                   c0.enabled ? 1 : 0, c0.fbp, c0.fbw, c0.psm, c0.read_width, c0.read_height,
+                   c1.enabled ? 1 : 0, c1.fbp, c1.fbw, c1.psm, c1.read_width, c1.read_height,
+                   pmode.en1 ? 1 : 0, pmode.en2 ? 1 : 0);
+      std::fflush(stderr);
+    }
+  }
+
+  const hwgs::display::CircuitRect &c0 = layout.circuits[0];
+  const hwgs::display::CircuitRect &c1 = layout.circuits[1];
+  const hwgs::display::MergePlan plan = hwgs::display::plan_merge(pmode, c0, c1, true, true);
+  const hwgs::display::CircuitRect *single = nullptr;
+  if (plan.use_rc1 && !plan.use_rc2) {
+    single = &c0;
+  } else if (plan.use_rc2 && !plan.use_rc1) {
+    single = &c1;
+  }
+  impl_->disp_fbp = single != nullptr ? single->fbp : 0xFFFFFFFFu;
+
   if (impl_->writeback.ready()) {
-    const hwgs::display::MergePlan plan =
-        hwgs::display::plan_merge(pmode, layout.circuits[0], layout.circuits[1], true, false);
-    const hwgs::display::CircuitRect &c = layout.circuits[0];
-    const bool single = plan.use_rc1 && !plan.use_rc2 && c.enabled && c.read_width > 0 && c.read_height > 0;
-    if (single) {
+    // NX-2026-11-13-H: EN2-only (RC2) must GPU-scanout; prior hard-coded circuits[0]/RC1-only.
+    if (single != nullptr && single->enabled && single->read_width > 0 && single->read_height > 0) {
       gt4::perf::Scope compose(gt4::perf::kGsCompose);
       std::string err;
-      if (impl_->writeback.try_scanout(c.fbp, c.fbw, c.psm, c.dbx, c.dby, c.read_width, c.read_height,
-                                       c.display_width, c.display_height, request.pixels, err)) {
-        request.width = c.display_width;
-        request.height = c.display_height;
+      if (impl_->allow_direct && impl_->gpu_present && impl_->window_attached &&
+          impl_->writeback.try_present_direct(single->fbp, single->fbw, single->psm, single->dbx, single->dby,
+                                              single->read_width, single->read_height, single->display_width,
+                                              single->display_height, impl_->cpu->Memory().Local(), err)) {
+        request.pixels.clear();
+        request.width = single->display_width;
+        request.height = single->display_height;
+        impl_->last_direct = true;
         impl_->last_frame.valid = true;
         impl_->last_frame.image.width = request.width;
         impl_->last_frame.image.height = request.height;
         return true;
       }
+      if (impl_->writeback.try_scanout(single->fbp, single->fbw, single->psm, single->dbx, single->dby,
+                                       single->read_width, single->read_height, single->display_width,
+                                       single->display_height, request.pixels, impl_->cpu->Memory().Local(),
+                                     err)) {
+        request.width = single->display_width;
+        request.height = single->display_height;
+        impl_->last_frame.valid = true;
+        impl_->last_frame.image.width = request.width;
+        impl_->last_frame.image.height = request.height;
+        return true;
+      }
+    } else {
+      // NX-2026-11-13-I: rare — plan is not a single GPU-scanout circuit.
+      static std::uint64_t scanout_skip_n = 0;
+      if ((++scanout_skip_n % 120u) == 1u) {
+        std::fprintf(stderr,
+                     "[hw-dk] scanout-skip: plan=outcome=%u use_rc1=%d use_rc2=%d single_read=%d "
+                     "en1=%d en2=%d c0_en=%d c1_en=%d\n",
+                     static_cast<unsigned>(plan.outcome), plan.use_rc1 ? 1 : 0, plan.use_rc2 ? 1 : 0,
+                     plan.single_read ? 1 : 0, pmode.en1 ? 1 : 0, pmode.en2 ? 1 : 0, c0.enabled ? 1 : 0,
+                     c1.enabled ? 1 : 0);
+        std::fflush(stderr);
+      }
     }
   }
 
   impl_->cpu->SyncForDisplay();
+
+  // NX-2026-11-13-I: ≤64 SLM taps at active DISPFB (prefer c1 when EN2-only) after sync, before compose.
+  {
+    static std::uint64_t slm_dispfb_n = 0;
+    if ((++slm_dispfb_n % 60u) == 1u) {
+      const hwgs::display::CircuitRect *sample = nullptr;
+      if (pmode.en2 && !pmode.en1 && c1.enabled) {
+        sample = &c1;
+      } else if (single != nullptr && single->enabled) {
+        sample = single;
+      } else if (c0.enabled) {
+        sample = &c0;
+      } else if (c1.enabled) {
+        sample = &c1;
+      }
+      if (sample != nullptr && sample->read_width > 0 && sample->read_height > 0 && sample->dbx >= 0 &&
+          sample->dby >= 0) {
+        const auto decoded = hwgs::memory::decodePsm(sample->psm);
+        if (decoded) {
+          const hwgs::memory::BufferView view{hwgs::memory::blockOfPage(sample->fbp), sample->fbw, *decoded};
+          hwgs::memory::LocalMemory &local = impl_->cpu->Memory().Local();
+          constexpr std::uint32_t kMaxTaps = 64u;
+          const std::uint32_t rw = sample->read_width;
+          const std::uint32_t rh = sample->read_height;
+          const std::uint32_t ox = static_cast<std::uint32_t>(sample->dbx);
+          const std::uint32_t oy = static_cast<std::uint32_t>(sample->dby);
+          const std::uint32_t step_x = std::max(1u, (rw + 7u) / 8u);
+          const std::uint32_t step_y = std::max(1u, (rh + 7u) / 8u);
+          std::uint32_t taps = 0;
+          std::uint32_t nonzero = 0;
+          std::uint32_t max_ch = 0;
+          std::int32_t first_x = -1;
+          std::int32_t first_y = -1;
+          for (std::uint32_t y = 0; y < rh && taps < kMaxTaps; y += step_y) {
+            for (std::uint32_t x = 0; x < rw && taps < kMaxTaps; x += step_x) {
+              const std::uint32_t word = local.readPixel(view, ox + x, oy + y);
+              const std::uint32_t r = word & 0xFFu;
+              const std::uint32_t g = (word >> 8) & 0xFFu;
+              const std::uint32_t b = (word >> 16) & 0xFFu;
+              const std::uint32_t ch = std::max(r, std::max(g, b));
+              if (ch > max_ch) max_ch = ch;
+              if ((word & 0xFFFFFFu) != 0u) {
+                ++nonzero;
+                if (first_x < 0) {
+                  first_x = static_cast<std::int32_t>(x);
+                  first_y = static_cast<std::int32_t>(y);
+                }
+              }
+              ++taps;
+            }
+          }
+          std::fprintf(stderr,
+                       "[hw-dk] slm-dispfb: fbp=%u psm=%u nonzero_rgb=%u/%u max=%u first=(%d,%d)\n",
+                       sample->fbp, sample->psm, nonzero, taps, max_ch, first_x, first_y);
+          std::fflush(stderr);
+        }
+      }
+    }
+  }
+
   gt4::perf::Scope compose(gt4::perf::kGsCompose);
   hwgs::cpuref::FrameImage frame = impl_->cpu->ComposeDisplay(layout, pmode);
   impl_->last_frame = frame;
@@ -270,6 +399,13 @@ bool Backend::attach_window(void *hwnd, std::string &error) {
   (void)error;
   // Switch has no HWND; present uses the platform swapchain opened by soft_present_begin.
   impl_->window_attached = true;
+  // Hand the renderer's device to present: scanout becomes a GPU blit into a deko swapchain.
+  // Failure keeps the libnx CPU framebuffer path (attach restores it).
+  if (impl_->writeback.ready() && !impl_->gpu_present && impl_->dk.device && impl_->dk.queue) {
+    impl_->gpu_present = gt4::platform::nx::deko3d_present_attach_gpu(impl_->dk.device, impl_->dk.queue);
+    std::fprintf(stderr, "[hw-dk] gpu present attach: %s\n", impl_->gpu_present ? "ok" : "failed (cpu path)");
+    std::fflush(stderr);
+  }
   return true;
 }
 
@@ -291,6 +427,12 @@ void Backend::present(PresentPhase phase) {
   // in half and stops bob on a progressive panel; race path forces 480p separately.
   const std::uint64_t smode2 = s.cpu ? s.cpu->DisplayRegs().smode2 : 0;
   const bool ffmd = (smode2 & 3u) == 3u;
+  if (ffmd && (s.present_frames & 1u) != 0 && s.last_direct && s.last_frame.valid) {
+    // Swapchain still shows the even field; no blit, no CPU work.
+    ++s.field_holds;
+    ++s.present_frames;
+    return;
+  }
   if (ffmd && (s.present_frames & 1u) != 0 && !s.last_scanout.pixels.empty()) {
     ++s.field_holds;
     present_slot();
@@ -309,7 +451,38 @@ bool Backend::end_frame(PresentPhase phase) {
   }
   if (s.cpu) s.cpu->SetDisplayField(phase == PresentPhase::field_odd);
   s.last_scanout.phase = phase;
-  if (!scanout(s.last_scanout) || s.last_scanout.pixels.empty()) {
+  s.last_direct = false;
+  s.allow_direct = true;
+  const bool ok = scanout(s.last_scanout);
+  s.allow_direct = false;
+  // NX-2026-11-27-U: count flips (DISPFB changed) and presents that carry new GPU draws.
+  // Draws counted at scanout include the ones flushed for display this present.
+  {
+    const std::uint64_t draws_now = s.writeback.ready() ? s.writeback.stats().draws : 0;
+    const bool new_draws = draws_now != s.last_draws;
+    s.last_draws = draws_now;
+    const bool flip = s.disp_fbp != s.last_disp_fbp;
+    s.last_disp_fbp = s.disp_fbp;
+    if (flip) { ++s.disp_flips; ++s.win_flips; }
+    if (new_draws) { ++s.draw_presents; ++s.win_draw_presents; }
+    ++s.win_presents;
+    const std::uint64_t now = armGetSystemTick();
+    if (s.win_start_tick == 0) s.win_start_tick = now;
+    const double secs = armTicksToNs(now - s.win_start_tick) / 1e9;
+    if (secs >= 2.0) {
+      std::fprintf(stderr,
+                   "[hw-dk] displayed: secs=%.2f presents=%llu (%.1f/s) flips=%llu (%.1f/s) "
+                   "presents_with_draws=%llu (%.1f/s) disp_fbp=%u field_holds=%llu\n",
+                   secs, static_cast<unsigned long long>(s.win_presents), s.win_presents / secs,
+                   static_cast<unsigned long long>(s.win_flips), s.win_flips / secs,
+                   static_cast<unsigned long long>(s.win_draw_presents), s.win_draw_presents / secs,
+                   s.disp_fbp, static_cast<unsigned long long>(s.field_holds));
+      std::fflush(stderr);
+      s.win_start_tick = now;
+      s.win_presents = s.win_flips = s.win_draw_presents = 0;
+    }
+  }
+  if (!ok || (s.last_scanout.pixels.empty() && !s.last_direct)) {
     s.stats.black_presents++;
     s.last_frame.valid = false;
     return s.window_attached;
@@ -320,11 +493,16 @@ bool Backend::end_frame(PresentPhase phase) {
 void Backend::present_slot() {
   Impl &s = *impl_;
   if (!s.window_attached) return;
-  const ScanoutRequest &req = s.last_scanout;
-  if (!s.last_frame.valid || req.width == 0 || req.pixels.empty()) {
+  ScanoutRequest &req = s.last_scanout;
+  if (s.last_direct && s.last_frame.valid) { // already blitted into the swapchain by scanout()
+    ++s.present_frames;
+    return;
+  }
+  if (!s.last_frame.valid || req.width == 0 || req.height == 0 || req.pixels.empty()) {
     gt4::platform::nx::soft_present_heartbeat(s.present_frames++);
     return;
   }
+  // NX-2026-11-13-C magenta present probe removed (owner Confirmed magenta on screen → host present OK).
   hwgs::dk::present_rgba(req.pixels.data(), req.width, req.height, s.present_frames++);
 }
 

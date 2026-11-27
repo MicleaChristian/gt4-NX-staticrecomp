@@ -10,6 +10,10 @@
 #include <cstdint>
 #include <cstring>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace gt4::ipu_fast {
 
 // n bits (1 to 32) from bit position `bit` of the stream, most significant first; bytes past the end read as zero.
@@ -39,6 +43,46 @@ inline void idct(const double (&by_x)[8][8], const double (&by_u)[8][8], const i
     for (int i = 0; i < 64; ++i) out[i] = value;
     return;
   }
+#if defined(__aarch64__)
+  // NX-2026-11-27-BU: the same sums, two x at a time (NEON, 64-bit lanes). Each lane does the
+  // multiplication and the addition the loops below do for that x, in the same order, as two
+  // separate operations (no fused multiply-add), so each output is the same double. Run BT, video
+  // menus at the stock clock: 260 to 390 macroblocks per frame cost 6.4 to 9.6 ms in the decoder.
+  {
+    float64x2_t nrows[8][4];
+    bool nrow_used[8];
+    for (int v = 0; v < 8; ++v) {
+      nrow_used[v] = false;
+      for (int u = 0; u < 8; ++u) {
+        const int coefficient = in[v * 8 + u];
+        if (coefficient == 0) continue;
+        if (!nrow_used[v]) {
+          for (int k = 0; k < 4; ++k) nrows[v][k] = vdupq_n_f64(0.0);
+          nrow_used[v] = true;
+        }
+        const float64x2_t scale = vdupq_n_f64(static_cast<double>(coefficient));
+        for (int k = 0; k < 4; ++k) nrows[v][k] = vaddq_f64(nrows[v][k], vmulq_f64(vld1q_f64(&by_u[u][k * 2]), scale));
+      }
+    }
+    const float64x2_t half = vdupq_n_f64(0.5);
+    const int32x4_t lo = vdupq_n_s32(-256), hi = vdupq_n_s32(255);
+    for (int y = 0; y < 8; ++y) {
+      float64x2_t sum[4] = {vdupq_n_f64(0.0), vdupq_n_f64(0.0), vdupq_n_f64(0.0), vdupq_n_f64(0.0)};
+      for (int v = 0; v < 8; ++v) {
+        if (!nrow_used[v]) continue;
+        const float64x2_t scale = vdupq_n_f64(by_x[y][v]);
+        for (int k = 0; k < 4; ++k) sum[k] = vaddq_f64(sum[k], vmulq_f64(scale, nrows[v][k]));
+      }
+      // floor(sum + 0.5) as an integer, clamped to -256..255 (the sums are far inside 32 bits).
+      int32x2_t part[4];
+      for (int k = 0; k < 4; ++k) part[k] = vmovn_s64(vcvtq_s64_f64(vrndmq_f64(vaddq_f64(sum[k], half))));
+      const int32x4_t a = vminq_s32(vmaxq_s32(vcombine_s32(part[0], part[1]), lo), hi);
+      const int32x4_t b = vminq_s32(vmaxq_s32(vcombine_s32(part[2], part[3]), lo), hi);
+      vst1q_s16(out + y * 8, vcombine_s16(vmovn_s32(a), vmovn_s32(b)));
+    }
+    return;
+  }
+#endif
   alignas(16) double rows[8][8];
   bool row_used[8];
   for (int v = 0; v < 8; ++v) {

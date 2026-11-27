@@ -1,11 +1,18 @@
-// TASK-174 S3/S4: strong Switch entry — donor boot + soft framebuffer present.
+// TASK-174: strong Switch entry — donor boot + CoreGS BackendDk (deko3d present).
 #include "runtime_link.hpp"
 
+#include "coregs_nx.hpp"
+#include "gt4_switch.hpp"
+#include "perf_nx.hpp"
 #include "platform/nx/deko3d_present.hpp"
+#include "ps2/memory.hpp"
 #include "ps2/system.hpp"
+#include "race_display.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -15,6 +22,11 @@
 
 void register_generated_code();
 void register_generated_vu();
+
+#if defined(__SWITCH__)
+// Strong when VU1 AOT overlay is linked (patch-vu-perf.py); null when stubbed.
+extern "C" void gt4_vu1_aot_snapshot(std::uint64_t *, std::uint64_t *, std::uint64_t *) __attribute__((weak));
+#endif
 
 namespace {
 
@@ -35,8 +47,13 @@ void set_msg(char *message, std::size_t cap, const char *text) {
 PadState g_boot_pad{};
 std::vector<std::uint32_t> g_frame_rgba;
 std::string g_last_app_dir;
+// NX-2026-11-27-AC: "_depth_on" / "_depth_off", part of every log file name so a copied log
+// says which mode produced it. Uses the same opt-in file lookup as WritebackDk.
+std::string g_log_tag;
+std::vector<std::uint32_t> g_held_field;
+std::uint32_t g_held_w = 0;
+std::uint32_t g_held_h = 0;
 
-// DualShock digital bits (pressed = 1), matching the Windows pad path / sio2.
 constexpr std::uint16_t kBtnSelect = 1u << 0;
 constexpr std::uint16_t kBtnL3 = 1u << 1;
 constexpr std::uint16_t kBtnR3 = 1u << 2;
@@ -55,63 +72,55 @@ constexpr std::uint16_t kBtnCross = 1u << 14;
 constexpr std::uint16_t kBtnSquare = 1u << 15;
 
 void write_halt_log(const char *why) {
-  if (g_last_app_dir.empty()) return;
-  const std::string path = g_last_app_dir + "/last_boot.txt";
-  if (FILE *f = std::fopen(path.c_str(), "wb")) {
-    std::fprintf(f, "frames=%llu\nhalted=%d\nwhy=%s\n",
-                 static_cast<unsigned long long>(ps2::frame_count()), ps2::halted() ? 1 : 0, why ? why : "");
-    std::fclose(f);
-  }
+  if (g_last_app_dir.empty() || !why) return;
+  const std::string path = g_last_app_dir + "/halt" + g_log_tag + ".log";
+  FILE *f = std::fopen(path.c_str(), "wb");
+  if (!f) return;
+  std::fprintf(f, "%s\n", why);
+  std::fclose(f);
 }
 
 std::uint8_t stick_to_ps2(float v, bool invert) {
-  const float s = invert ? -v : v;
-  const int t = static_cast<int>(128.f + s * 127.f);
-  if (t < 0) return 0;
-  if (t > 255) return 255;
-  return static_cast<std::uint8_t>(t);
+  float t = invert ? -v : v;
+  if (t < -1.f) t = -1.f;
+  if (t > 1.f) t = 1.f;
+  return static_cast<std::uint8_t>((t * 0.5f + 0.5f) * 255.f + 0.5f);
 }
 
 void feed_guest_pad() {
   padUpdate(&g_boot_pad);
   const u64 down = padGetButtons(&g_boot_pad);
-  std::uint16_t mask = 0;
-  if (down & HidNpadButton_B) mask |= kBtnCross;      // Switch B = Cross (US confirm)
-  if (down & HidNpadButton_A) mask |= kBtnCircle;     // Switch A = Circle
-  if (down & HidNpadButton_Y) mask |= kBtnSquare;
-  if (down & HidNpadButton_X) mask |= kBtnTriangle;
-  if (down & HidNpadButton_Plus) mask |= kBtnStart;
-  if (down & HidNpadButton_Minus) mask |= kBtnSelect;
-  if (down & HidNpadButton_L) mask |= kBtnL1;
-  if (down & HidNpadButton_R) mask |= kBtnR1;
-  if (down & HidNpadButton_ZL) mask |= kBtnL2;
-  if (down & HidNpadButton_ZR) mask |= kBtnR2;
-  if (down & HidNpadButton_StickL) mask |= kBtnL3;
-  if (down & HidNpadButton_StickR) mask |= kBtnR3;
-  if (down & HidNpadButton_Up) mask |= kBtnUp;
-  if (down & HidNpadButton_Down) mask |= kBtnDown;
-  if (down & HidNpadButton_Left) mask |= kBtnLeft;
-  if (down & HidNpadButton_Right) mask |= kBtnRight;
-
-  ps2::set_pad_buttons(mask);
-  // Pressures: full when digital button is down (menus need Cross pressure on some paths).
-  for (int b = 0; b < 16; ++b)
-    ps2::set_pad_pressure(b, (mask & (1u << b)) ? 255 : 0);
+  std::uint16_t buttons = 0;
+  if (down & HidNpadButton_Minus) buttons |= kBtnSelect;
+  if (down & HidNpadButton_StickL) buttons |= kBtnL3;
+  if (down & HidNpadButton_StickR) buttons |= kBtnR3;
+  if (down & HidNpadButton_Plus) buttons |= kBtnStart;
+  if (down & HidNpadButton_Up) buttons |= kBtnUp;
+  if (down & HidNpadButton_Right) buttons |= kBtnRight;
+  if (down & HidNpadButton_Down) buttons |= kBtnDown;
+  if (down & HidNpadButton_Left) buttons |= kBtnLeft;
+  if (down & HidNpadButton_ZL) buttons |= kBtnL2;
+  if (down & HidNpadButton_ZR) buttons |= kBtnR2;
+  if (down & HidNpadButton_L) buttons |= kBtnL1;
+  if (down & HidNpadButton_R) buttons |= kBtnR1;
+  if (down & HidNpadButton_X) buttons |= kBtnTriangle;
+  if (down & HidNpadButton_A) buttons |= kBtnCircle;
+  if (down & HidNpadButton_B) buttons |= kBtnCross;
+  if (down & HidNpadButton_Y) buttons |= kBtnSquare;
+  ps2::set_pad_buttons(buttons);
 
   const HidAnalogStickState left = padGetStickPos(&g_boot_pad, 0);
   const HidAnalogStickState right = padGetStickPos(&g_boot_pad, 1);
   const float lx = static_cast<float>(left.x) / 32767.f;
-  const float ly = static_cast<float>(-left.y) / 32767.f; // up positive
+  const float ly = static_cast<float>(-left.y) / 32767.f;
   const float rx = static_cast<float>(right.x) / 32767.f;
   const float ry = static_cast<float>(-right.y) / 32767.f;
-  // PS2 order: RX, RY, LX, LY — 0 = left/up, 255 = right/down.
   ps2::set_pad_axis(0, stick_to_ps2(rx, false));
   ps2::set_pad_axis(1, stick_to_ps2(ry, true));
   ps2::set_pad_axis(2, stick_to_ps2(lx, false));
   ps2::set_pad_axis(3, stick_to_ps2(ly, true));
 }
 
-// Pump Atmosphere, feed pad into the guest, allow hold-Plus abort, blit GS + cyan OSD.
 void switch_host_vblank() {
   if (!appletMainLoop()) {
     write_halt_log("host requested exit");
@@ -120,27 +129,106 @@ void switch_host_vblank() {
   }
   const std::uint64_t frame = ps2::frame_count();
   feed_guest_pad();
-  // Hold Plus for abort (Start is also Plus for the guest; short taps stay in-game Start).
-  static int plus_held = 0;
+
+  // Prefer progressive race index when the game exposes it (cuts 480i bob).
+  static gt4::display::Force480pState force480p{};
+  gt4::display::force_race_480p_at_vblank(ps2::g_ram, ps2::kRamSize, force480p);
+
+  // Wall-clock hold, not guest frames: at ~7 FPS the old "90 frames" needed ~13s of
+  // holding Plus, so it felt broken. Short taps still reach the guest as Start.
+  static u64 plus_down_tick = 0;
+  const u64 now_tick = armGetSystemTick();
   if (padGetButtons(&g_boot_pad) & HidNpadButton_Plus) {
-    if (frame > 45) ++plus_held;
+    // Ignore hold during the first ~30 guest frames so boot/title can use Start.
+    if (frame <= 30) {
+      plus_down_tick = 0;
+    } else {
+      if (plus_down_tick == 0) plus_down_tick = now_tick;
+      if (armTicksToNs(now_tick - plus_down_tick) >= 1'000'000'000ull) {
+        write_halt_log("plus hold abort");
+        ps2::halt("plus hold abort");
+        return;
+      }
+    }
   } else {
-    plus_held = 0;
+    plus_down_tick = 0;
   }
-  if (plus_held > 90) { // ~1.5s hold
-    write_halt_log("plus hold abort");
-    ps2::halt("plus hold abort");
+
+  const bool coregs = gt4::switch_app::coregs_active();
+  gt4::perf::FrameExtras extras{};
+  extras.coregs = coregs;
+  if (coregs) {
+    gt4::switch_app::coregs_fill_perf(extras.gif_bytes, extras.gpu_draws, extras.gpu_batches,
+                                      extras.cpu_fallback, extras.tex_cache_hits, extras.wb_flushes);
+  }
+  if (gt4_vu1_aot_snapshot) {
+    gt4_vu1_aot_snapshot(&extras.vu1_aot_compiled, &extras.vu1_aot_interpreted, &extras.vu1_identity_rejects);
+  }
+  gt4::perf::on_vblank(frame, ps2::vu1_interpreted_calls(), &extras);
+
+  // NX-2026-11-27-BF: on-screen frame rate (top left, after the build ID), refreshed twice a
+  // second: guest frames per second over the last half second.
+  {
+    static std::uint64_t fps_tick = 0;
+    static std::uint64_t fps_frame = 0;
+    const std::uint64_t t = armGetSystemTick();
+    if (fps_tick == 0) {
+      fps_tick = t;
+      fps_frame = frame;
+    } else if (armTicksToNs(t - fps_tick) >= 500'000'000ull) {
+      const double secs = static_cast<double>(armTicksToNs(t - fps_tick)) / 1.0e9;
+      char text[32];
+      std::snprintf(text, sizeof text, "FPS %.1f", static_cast<double>(frame - fps_frame) / secs);
+      gt4::platform::nx::deko3d_present_set_status(text);
+      fps_tick = t;
+      fps_frame = frame;
+    }
+  }
+
+  // NX-2026-11-27-BC: hard cap at the NTSC field rate (59.94 per second). A guest frame never
+  // starts sooner than one period after the previous one started; a late frame is not made up
+  // for, so the rate can fall below the cap but never rise above it. Screens that present
+  // nothing new ran at 110 to 130 guest frames per second (game and sound at double speed).
+  {
+    static std::uint64_t next_tick = 0;
+    const std::uint64_t period = armNsToTicks(16683333ull);
+    std::uint64_t now = armGetSystemTick();
+    if (next_tick != 0 && now < next_tick) {
+      svcSleepThread(static_cast<s64>(armTicksToNs(next_tick - now)));
+      now = armGetSystemTick();
+    }
+    next_tick = std::max(next_tick, now) + period;
+    if (next_tick < now + period / 2) next_tick = now + period;
+  }
+
+  if (coregs) {
+    gt4::perf::Scope scope(gt4::perf::kCoreGsFrame);
+    if (!gt4::switch_app::coregs_vblank_present(frame)) {
+      gt4::platform::nx::soft_present_heartbeat(frame);
+    }
     return;
   }
 
-  // Always refresh the cyan OSD every guest frame. GS blit is expensive on CPU raster,
-  // so only pull a guest frame every 4th vblank (OSD still moves every frame).
+  // Donor CPU GS: field-hold on odd frames (re-present last even field) to stop 480i shake.
   std::uint32_t w = 0, h = 0;
-  const bool try_gs = (frame <= 3) || ((frame % 4) == 0);
-  if (try_gs && ps2::display_frame(g_frame_rgba, w, h) && w > 0 && h > 0) {
-    gt4::platform::nx::deko3d_present_frame(reinterpret_cast<const std::uint8_t *>(g_frame_rgba.data()),
-                                            g_frame_rgba.size() * 4u, static_cast<int>(w), static_cast<int>(h),
-                                            frame);
+  const bool odd = (frame & 1u) != 0;
+  bool fresh = false;
+  if (!odd) {
+    gt4::perf::Scope scope(gt4::perf::kSoftFrame);
+    fresh = ps2::display_frame(g_frame_rgba, w, h) && w > 0 && h > 0;
+  }
+  if (fresh) {
+    g_held_field.swap(g_frame_rgba);
+    g_held_w = w;
+    g_held_h = h;
+  }
+  if (!g_held_field.empty()) {
+    // Odd frames re-show the held field; skip the copy when nothing new arrived.
+    if (fresh || !odd) {
+      gt4::platform::nx::deko3d_present_frame(reinterpret_cast<const std::uint8_t *>(g_held_field.data()),
+                                              g_held_field.size() * 4u, static_cast<int>(g_held_w),
+                                              static_cast<int>(g_held_h), frame);
+    }
   } else {
     gt4::platform::nx::soft_present_heartbeat(frame);
   }
@@ -166,7 +254,7 @@ extern "C" int gt4_switch_runtime_probe(const char *iso_path_utf8, const char *a
     return 3;
   }
   set_msg(message, message_cap,
-          "Runtime linked. A=300f, X=long. libnx present (CPU GS). Plus aborts.");
+          "Runtime linked. CoreGS (deko3d GPU). Hold Plus to abort.");
   return 0;
 }
 
@@ -182,6 +270,28 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
 
 #if defined(__SWITCH__)
   g_last_app_dir = app;
+  // stderr -> stderr.log next to the NRO (CoreGS / WritebackDk / donor diagnostics).
+  {
+    const std::string app_flag = app + "/depth_on";
+    const char *candidates[] = {app_flag.c_str(), "depth_on", "sdmc:/switch/gt4recomp/depth_on"};
+    g_log_tag = "_depth_off";
+    for (const char *path : candidates) {
+      if (file_readable(path)) {
+        g_log_tag = "_depth_on";
+        break;
+      }
+    }
+  }
+  if (std::freopen((app + "/stderr" + g_log_tag + ".log").c_str(), "wb", stderr)) {
+    // Unbuffered: a crash must not take the last lines with it (stderr is not on a hot path).
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+  }
+  gt4::perf::open_log(app.c_str(), g_log_tag.c_str());
+  gt4::perf::prof_register("main"); // NX-2026-11-27-BZ: sampling profiler, see perf_nx.hpp
+  gt4::perf::prof_start();
+  std::fprintf(stderr,
+               "[gt4-switch] logs: perf%s.log (CSV/60f), session_summary%s.txt (on exit), stderr%s.log, halt%s.log\n",
+               g_log_tag.c_str(), g_log_tag.c_str(), g_log_tag.c_str(), g_log_tag.c_str());
 #endif
 
   std::fprintf(stderr, "[gt4-switch] boot elf=%s disc=%s memcard=%s frames=%llu\n", elf.c_str(), iso_path_utf8,
@@ -205,7 +315,19 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
     appletLockExit();
     return 5;
   }
+  const auto settings = gt4::switch_app::load_settings(std::filesystem::path(app));
+  if (!settings.coregs) {
+    std::fprintf(stderr, "[gt4-switch] WARNING: coregs.off found; donor CPU GS (debug only, very slow)\n");
+  } else if ((gt4::switch_app::coregs_set_threaded(!std::filesystem::exists(std::filesystem::path(app) / "gsthread.off")),
+              gt4::switch_app::coregs_set_vu_threaded(!std::filesystem::exists(std::filesystem::path(app) / "vuthread.off")),
+              !gt4::switch_app::coregs_start(settings.gpu_draw))) {
+    std::fprintf(stderr, "[gt4-switch] ERROR: CoreGS start failed; falling back to donor CPU GS (very slow)\n");
+    write_halt_log("CoreGS start failed; see stderr.log");
+  }
   ps2::g_options.on_vblank = switch_host_vblank;
+  ps2::set_audio_sink([](const std::int16_t *samples, std::size_t frames) {
+    gt4::switch_app::audio_push(samples, frames);
+  });
 #endif
 
   std::uint32_t entry = 0;
@@ -213,6 +335,8 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
     std::fprintf(stderr, "[gt4-switch] load_elf failed for %s\n", elf.c_str());
 #if defined(__SWITCH__)
     ps2::g_options.on_vblank = nullptr;
+    ps2::set_audio_sink(nullptr);
+    gt4::switch_app::coregs_stop();
     gt4::platform::nx::soft_present_end();
     write_halt_log("load_elf failed");
     appletLockExit();
@@ -224,16 +348,25 @@ extern "C" int gt4_switch_game_main_frames(const char *iso_path_utf8, const char
   const int rc = ps2::run();
 #if defined(__SWITCH__)
   ps2::g_options.on_vblank = nullptr;
+  ps2::set_audio_sink(nullptr);
+  gt4::switch_app::audio_report(stderr);
   char why[128];
-  std::snprintf(why, sizeof why, "run returned rc=%d frames=%llu halted=%d", rc,
-                static_cast<unsigned long long>(ps2::frame_count()), ps2::halted() ? 1 : 0);
+  std::snprintf(why, sizeof why, "run returned rc=%d frames=%llu halted=%d coregs=%d", rc,
+                static_cast<unsigned long long>(ps2::frame_count()), ps2::halted() ? 1 : 0,
+                gt4::switch_app::coregs_active() ? 1 : 0);
   write_halt_log(why);
+  gt4::perf::close_log();
+  std::fflush(stderr);
+  gt4::switch_app::coregs_stop();
   gt4::platform::nx::soft_present_end();
   appletLockExit();
 #endif
   return rc;
 }
 
-extern "C" int gt4_switch_game_main(const char *iso_path_utf8, const char *app_dir_utf8) {
+// Keep the thin wrapper despite -ffunction-sections/--gc-sections: runtime_bridge
+// only calls _frames, so without used the strong T entry disappears from the ELF.
+extern "C" __attribute__((used)) int gt4_switch_game_main(const char *iso_path_utf8,
+                                                          const char *app_dir_utf8) {
   return gt4_switch_game_main_frames(iso_path_utf8, app_dir_utf8, 0);
 }

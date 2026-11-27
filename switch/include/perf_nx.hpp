@@ -68,12 +68,27 @@ struct FrameExtras {
   bool coregs = false;
 };
 
-void open_log(const char *app_dir);
+void open_log(const char *app_dir, const char *tag = "");
 void close_log();
 // Called once per guest vblank. `extras` may be null (zeros).
 void on_vblank(std::uint64_t guest_frame, std::uint64_t vu1_interpreted_calls, const FrameExtras *extras);
 
 // Present path reports the last guest frame size (for the CSV).
 void note_present_size(int width, int height);
+
+// NX-2026-11-27-BA: ticks the GS thread spent executing commands (see coregs_nx.cpp). Reported as
+// gs_thread in the [sys] line. With the GS thread on, the GIF / GS slots are measured on that
+// thread and run at the same time as the EE slots, so the slot columns can add up to more than
+// the frame; coregs_glue_ms on the main thread is then the time it waited for the GS thread.
+void note_gs_thread_busy(std::uint64_t ticks);
+
+// NX-2026-11-27-BZ: sampling profiler. A helper thread stops each registered thread for an
+// instant about 1000 times a second, reads where it was executing, and counts it in 64-byte
+// buckets of the program's code. Every 15 seconds the counts go to prof<tag>.log (one line per
+// bucket: thread name, offset in the program, samples) and start again from zero. The offsets
+// are those of gt4recomp.elf, so addr2line names the function. An empty file `prof.off` next to
+// the program turns it off. A thread calls prof_register itself, once.
+void prof_register(const char *name);
+void prof_start();
 
 } // namespace gt4::perf

@@ -581,11 +581,152 @@ void encodeHostTexel(std::vector<std::uint8_t>& data, std::uint32_t bpp, std::ui
 
 }  // namespace
 
+// NX-2026-11-27-BD: per format, the byte offset inside a page of every pixel of the page (block
+// from the block table * 256 + byte in the block + the byte the field starts in) and, for 4-bit
+// fields, the shift of the nibble in that byte. Built once from kInPageTables, so the addressing is
+// the reference one by construction. hostToLocal's row-walking path computed a PixelSlot per pixel
+// (page, block, modulo, four fields) and branched on it: 280 MB/s on the Switch, 10 ms per frame
+// for the 2.8 MiB of texels GT4 uploads per race frame (run BC). `state` 2 = format not usable
+// with the tables (Z block order, or a field that is not byte / nibble aligned).
+bool g_uploadTablesEnabled = true;  // cleared by the host comparison test only
+
+namespace {
+
+struct UploadTable {
+    std::vector<std::uint16_t> offset;
+    std::vector<std::uint8_t> shift;
+    int state = 0;
+};
+
+const UploadTable& uploadTable(std::size_t tableIndex, const PsmInfo& info, std::uint32_t bpp) {
+    static std::vector<UploadTable> tables(kPsmTable.size());
+    UploadTable& table = tables[tableIndex];
+    if (table.state == 0) {
+        const auto& source = kInPageTables.perPsm[tableIndex];
+        table.state = info.zBlockXorApplies ? 2 : 1;
+        table.offset.resize(source.size());
+        table.shift.resize(source.size());
+        for (std::size_t i = 0; i < source.size() && table.state == 1; ++i) {
+            const InPageLocation& location = source[i];
+            const bool aligned = bpp == 32u  ? (location.bitShift == 0u && location.bitWidth == 32u)
+                                 : bpp == 8u ? (location.bitWidth == 8u && (location.bitShift & 7u) == 0u)
+                                             : (location.bitWidth == 4u && (location.bitShift & 3u) == 0u);
+            const std::uint32_t offset = static_cast<std::uint32_t>(location.tableBlock) * kBlockBytes + location.byteInBlock +
+                                         (bpp == 32u ? 0u : static_cast<std::uint32_t>(location.bitShift >> 3));
+            if (!aligned || offset > 0xFFFFu || (bpp == 32u && (offset & 3u) != 0u)) {
+                table.state = 2;
+                break;
+            }
+            table.offset[i] = static_cast<std::uint16_t>(offset);
+            table.shift[i] = static_cast<std::uint8_t>(location.bitShift & 4u);
+        }
+    }
+    return table;
+}
+
+}  // namespace
+
 std::uint32_t hostToLocal(LocalMemory& memory,
                           const BufferView& destination,
                           const TransferRect& rect,
                           std::span<const std::uint8_t> data) {
     const std::uint32_t bpp = psmInfo(destination.psm).transferBpp;
+    if (g_uploadTablesEnabled && (bpp == 32u || bpp == 8u || bpp == 4u) && rect.x + rect.width <= kTransferCoordinateWrap &&
+        rect.y + rect.height <= kTransferCoordinateWrap &&
+        static_cast<std::uint64_t>(rect.width) * rect.height * bpp <= static_cast<std::uint64_t>(data.size()) * 8u) {
+        const PsmInfo& info = psmInfo(destination.psm);
+        const std::size_t tableIndex = static_cast<std::size_t>(&info - kPsmTable.data());
+        const UploadTable& table = uploadTable(tableIndex, info, bpp);
+        if (table.state == 1) {
+            const RowWalker walker(info, destination);
+            std::uint8_t* bytes = memory.bytes().data();
+            const std::uint8_t* src = data.data();
+            const std::uint32_t pageWidth = info.pageWidth;
+            std::uint64_t index = 0;
+            for (std::uint32_t row = 0; row < rect.height; ++row) {
+                const std::uint32_t y = rect.y + row;
+                const std::size_t rowBase = static_cast<std::size_t>(y & (info.pageHeight - 1u)) * pageWidth;
+                const std::uint16_t* rowOffset = table.offset.data() + rowBase;
+                const std::uint8_t* rowShift = table.shift.data() + rowBase;
+                const std::uint32_t pageRow = (y >> walker.heightShift) * walker.perRow;
+                std::uint32_t x = rect.x;
+                const std::uint32_t end = rect.x + rect.width;
+                while (x < end) {
+                    const std::uint32_t pageX = x >> walker.widthShift;
+                    const std::uint32_t spanEnd = std::min(end, (pageX + 1u) << walker.widthShift);
+                    const std::uint32_t base =
+                        ((destination.basePointer + kBlocksPerPage * (pageRow + pageX)) % kBlocksTotal) * kBlockBytes;
+                    const std::uint32_t inPage = x & (pageWidth - 1u);
+                    const std::uint32_t count = spanEnd - x;
+                    if (bpp == 32u) {
+                        for (std::uint32_t k = 0; k < count; ++k, ++index) {
+                            std::memcpy(bytes + ((base + rowOffset[inPage + k]) & kLocalMemoryMask), src + index * 4u, 4);
+                        }
+                    } else if (bpp == 8u) {
+                        for (std::uint32_t k = 0; k < count; ++k, ++index) {
+                            bytes[(base + rowOffset[inPage + k]) & kLocalMemoryMask] = src[index];
+                        }
+                    } else {
+                        for (std::uint32_t k = 0; k < count; ++k, ++index) {
+                            const std::uint32_t value = (index & 1u) ? (src[index >> 1] >> 4) : (src[index >> 1] & 0x0Fu);
+                            std::uint8_t& b = bytes[(base + rowOffset[inPage + k]) & kLocalMemoryMask];
+                            const std::uint32_t sh = rowShift[inPage + k];
+                            b = static_cast<std::uint8_t>((b & ~(0x0Fu << sh)) | (value << sh));
+                        }
+                    }
+                    x = spanEnd;
+                }
+            }
+            return rect.width * rect.height;
+        }
+    }
+    // NX-2026-11-27-AI: row-walking path for 32, 8 and 4 bit uploads that do not wrap and whose data is
+    // complete. The loop below it decodes and bounds-checks every texel and writes it through a generic
+    // read-modify-write of four bytes; car select uploads about 3.6 MiB of 4 and 8 bit texels per frame
+    // (gif_ms 32 per frame in run AH). Same addressing (RowWalker), same bits stored.
+    if ((bpp == 32u || bpp == 8u || bpp == 4u) && rect.x + rect.width <= kTransferCoordinateWrap &&
+        rect.y + rect.height <= kTransferCoordinateWrap &&
+        static_cast<std::uint64_t>(rect.width) * rect.height * bpp <= static_cast<std::uint64_t>(data.size()) * 8u) {
+        const PsmInfo& info = psmInfo(destination.psm);
+        const RowWalker walker(info, destination);
+        const std::size_t tableIndex = static_cast<std::size_t>(&info - kPsmTable.data());
+        std::uint8_t* bytes = memory.bytes().data();
+        const std::uint8_t* src = data.data();
+        std::uint64_t index = 0;
+        for (std::uint32_t row = 0; row < rect.height; ++row) {
+            const std::uint32_t y = rect.y + row;
+            const InPageLocation* rowTable = kInPageTables.perPsm[tableIndex].data() +
+                                             static_cast<std::size_t>(y & (info.pageHeight - 1u)) * info.pageWidth;
+            for (std::uint32_t column = 0; column < rect.width; ++column, ++index) {
+                const PixelSlot slot = walker.slot(rect.x + column, y, rowTable);
+                if (bpp == 32u) {
+                    if (slot.bitShift == 0u && slot.bitWidth == 32u && slot.byteOffset + 4u <= kLocalMemoryBytes) {
+                        std::memcpy(bytes + slot.byteOffset, src + index * 4u, 4);
+                    } else {
+                        std::uint32_t value = 0;
+                        std::memcpy(&value, src + index * 4u, 4);
+                        memory.writeSlot(slot, value);
+                    }
+                } else if (bpp == 8u) {
+                    if (slot.bitWidth == 8u && (slot.bitShift & 7u) == 0u) {
+                        bytes[(slot.byteOffset + (slot.bitShift >> 3)) & kLocalMemoryMask] = src[index];
+                    } else {
+                        memory.writeSlot(slot, src[index]);
+                    }
+                } else {
+                    const std::uint32_t value = (index & 1u) ? (src[index >> 1] >> 4) : (src[index >> 1] & 0x0Fu);
+                    if (slot.bitWidth == 4u && (slot.bitShift & 3u) == 0u) {
+                        std::uint8_t& b = bytes[(slot.byteOffset + (slot.bitShift >> 3)) & kLocalMemoryMask];
+                        const std::uint32_t sh = slot.bitShift & 4u;
+                        b = static_cast<std::uint8_t>((b & ~(0x0Fu << sh)) | (value << sh));
+                    } else {
+                        memory.writeSlot(slot, value);
+                    }
+                }
+            }
+        }
+        return rect.width * rect.height;
+    }
     std::uint32_t pixelsWritten = 0;
     for (std::uint32_t row = 0; row < rect.height; ++row) {
         for (std::uint32_t column = 0; column < rect.width; ++column) {

@@ -1,0 +1,41 @@
+GT4Recomp NX 0.2.0 (work in progress, not full speed yet)
+=========================================================
+
+You need:
+  - A Nintendo Switch that runs homebrew (Atmosphere).
+  - Your own Gran Turismo 4 (USA, v2.00, SCUS-97328) disc image as a plain .iso.
+    The game is NOT included.
+  - A PC with Python 3, once, to make core.elf from your disc image.
+
+Steps:
+  1. Copy the folder "sd/switch" from this package onto the root of your SD card.
+     You now have: SD:/switch/GT4/gt4recomp.nro
+  2. Copy your .iso into SD:/switch/GT4/
+     (the SD card must be exFAT if the image is larger than 4 GiB).
+  3. On the PC, make core.elf from your own disc image:
+       Windows: drag the .iso onto tools\make-core-elf.cmd
+       Linux / macOS: bash tools/make-core-elf.sh /path/to/game.iso
+     Copy the resulting core.elf into SD:/switch/GT4/
+  4. Start "GT4Recomp" from the homebrew menu with full memory access
+     (hold R while starting a game title, or use a forwarder; not the album applet).
+
+The folder SD:/switch/GT4 then holds:
+  gt4recomp.nro      the program (from this package)
+  depth_on           empty file, turns depth testing on (from this package)
+  saves/             memory card, created on first run
+  core.elf           made by you in step 3
+  <your game>.iso    copied by you in step 2
+
+Optional empty files in the same folder (switches):
+  prof.off       turn the sampling profiler off
+  gsthread.off   graphics on the main thread (slower, for testing)
+  vuthread.off   VU1 on the main thread (slower, for testing)
+  disccache.off  read the disc image without the read-ahead cache
+
+Logs are written to the same folder (stderr_*.log, perf_*.log, sys_*.log, prof_*.log).
+Attach them to bug reports: https://github.com/MicleaChristian/gt4-NX-staticrecomp/issues
+
+Speed in this version (first-model Switch, handheld, stock clock):
+  car manufacturer menu 55 FPS, video menus about 25 FPS, car select 11 FPS, race about 12 FPS.
+
+Support the port: https://ko-fi.com/W1A12BEHQ8

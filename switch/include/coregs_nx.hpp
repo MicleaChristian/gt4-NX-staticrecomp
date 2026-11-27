@@ -8,6 +8,14 @@ namespace gt4::switch_app {
 
 // Starts GT4_RENDERER=hw with BackendDk. Returns false if init fails (caller keeps donor GS).
 bool coregs_start(bool gpu_draw);
+// NX-2026-11-27-BA: call before coregs_start. true (default): GIF packets, privileged writes and
+// the vblank present are queued and executed by a GS thread on CPU core 1. false: executed on
+// the calling thread as before (a `gsthread.off` file next to the NRO selects this).
+void coregs_set_threaded(bool threaded);
+// NX-2026-11-27-BF: call before coregs_start. true (default, needs the GS thread): VIF1 unpacking
+// and the VU1 programs run on a third thread (core 2), the runtime's own VU-thread mode; the main
+// thread keeps a shadow VIF1 for timing. false (`vuthread.off` next to the NRO): on the main thread.
+void coregs_set_vu_threaded(bool threaded);
 void coregs_stop();
 bool coregs_active();
 
