@@ -42,3 +42,13 @@ __pycache__/
 
 # Owner's community patch (never committed).
 *.xdelta
+
+# Local skill pack. Kept on disk, not in the repository.
+/.claude/
+/CLAUDE.md
+/gt4-switch-claude-skills/
+/gt4-switch-claude-skills.zip
+/VALIDATION.md
+/SOURCES.md
+/validate_pack.py
+/MANIFEST.sha256.json
