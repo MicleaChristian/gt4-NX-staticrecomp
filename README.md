@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **This project has moved.** Development continues at
+> [gt4-switch-native-port](https://github.com/MicleaChristian/gt4-switch-native-port), with a new goal: a native Switch
+> port that replaces the emulated PS2 video and graphics hardware (IPU, VU1, GS) with code written for the console.
+> This fork stays here with release 0.2.0 and is no longer updated.
+
 <div align="center">
 
 # GT4Recomp NX
